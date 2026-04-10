@@ -455,6 +455,18 @@ function buildBillingHeader() {
   return `x-anthropic-billing-header: cc_version=${CLI_VERSION}.${PROXY_SESSION_ID.slice(0, 8)}; cc_entrypoint=${CLI_ENTRYPOINT}; cch=00000;`;
 }
 
+// Detect a previously-injected billing header block so stale copies can be
+// stripped before a fresh one is prepended. Clients that cache request state
+// across turns may replay the proxy's previously-injected block; without
+// dedup, system accumulates multiple stacked billing headers with mismatched
+// session IDs, which upstream rejects.
+function isBillingHeaderBlock(b) {
+  return b
+    && b.type === 'text'
+    && typeof b.text === 'string'
+    && b.text.startsWith('x-anthropic-billing-header:');
+}
+
 function injectBillingHeader(body) {
   if (!body || typeof body !== 'object') return body;
   const result = { ...body };
@@ -467,8 +479,14 @@ function injectBillingHeader(body) {
     // String system prompt — convert to blocks and prepend billing header
     result.system = [billingBlock, { type: 'text', text: result.system }];
   } else if (Array.isArray(result.system)) {
-    // Already blocks — prepend billing header
-    result.system = [billingBlock, ...result.system];
+    // Strip any stale billing blocks the client may have cached from a
+    // previous request, then prepend exactly one fresh block.
+    const cleaned = result.system.filter(b => !isBillingHeaderBlock(b));
+    const stripped = result.system.length - cleaned.length;
+    if (stripped > 0) {
+      log(`stripped ${stripped} stale billing header block(s) from incoming system prompt`);
+    }
+    result.system = [billingBlock, ...cleaned];
   }
 
   return result;
@@ -678,6 +696,38 @@ function forwardRequest(req, res, body) {
 
       const { proxyRes } = result;
       debug(`← ${proxyRes.statusCode} ${proxyRes.statusMessage}`);
+
+      // On 4xx, buffer the body so we can log the actual error message from
+      // upstream instead of just the status line. Otherwise every 4xx looks
+      // identical in the log, regardless of root cause. The body is still
+      // forwarded to the client untouched.
+      if (proxyRes.statusCode >= 400 && proxyRes.statusCode < 500) {
+        const errChunks = [];
+        proxyRes.on('data', (c) => errChunks.push(c));
+        proxyRes.on('end', () => {
+          const raw = Buffer.concat(errChunks).toString('utf8');
+          let msg = raw;
+          try {
+            const parsed = JSON.parse(raw);
+            msg = parsed?.error?.message || raw;
+          } catch {}
+          log(`← ${proxyRes.statusCode} ${proxyRes.statusMessage} | ${msg.slice(0, 500)}`);
+          // Forward response headers + body unchanged.
+          const skip = new Set(['transfer-encoding', 'connection', 'keep-alive']);
+          for (const [k, v] of Object.entries(proxyRes.headers)) {
+            if (!skip.has(k.toLowerCase())) res.setHeader(k, v);
+          }
+          res.status(proxyRes.statusCode);
+          res.setHeader('content-length', Buffer.byteLength(raw));
+          res.end(raw);
+          resolve();
+        });
+        proxyRes.on('error', (err) => {
+          log('Response stream error (4xx path):', err.message);
+          resolve();
+        });
+        return;
+      }
 
       // Copy response headers
       const skipHeaders = new Set(['transfer-encoding', 'connection', 'keep-alive']);
