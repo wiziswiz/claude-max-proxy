@@ -84,9 +84,26 @@ Add this to `~/.openclaw/openclaw.json` under `models.providers`:
       "baseUrl": "http://127.0.0.1:4523",
       "apiKey": "claude-max-proxy",
       "models": [
+        { "id": "claude-opus-4-7",   "name": "Claude Opus 4.7",   "api": "anthropic-messages" },
         { "id": "claude-opus-4-6",   "name": "Claude Opus 4.6",   "api": "anthropic-messages" },
         { "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "api": "anthropic-messages" },
         { "id": "claude-haiku-4-5",  "name": "Claude Haiku 4.5",  "api": "anthropic-messages" }
+      ]
+    }
+  }
+}
+```
+
+The proxy is model-agnostic — it forwards whatever model ID your client requests. Any Claude model your account has access to will work, including new models released after this README was last updated. To set your default, edit `agents.defaults.model` in `openclaw.json`:
+
+```json
+"agents": {
+  "defaults": {
+    "model": {
+      "primary": "anthropic/claude-opus-4-7",
+      "fallbacks": [
+        "anthropic/claude-sonnet-4-6",
+        "anthropic/claude-opus-4-6"
       ]
     }
   }
@@ -143,7 +160,7 @@ Everything. The proxy only modifies auth headers and normalizes the request body
 - **Images / vision** — base64 image blocks
 - **Extended thinking** — thinking blocks pass through
 - **Cache control** — prompt caching headers and stats
-- **All models** — claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5, etc.
+- **All models** — claude-opus-4-7, claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5, etc. The proxy forwards any model ID verbatim, so new Anthropic models work automatically as long as your subscription has access.
 
 ## Token management
 
