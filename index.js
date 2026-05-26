@@ -341,7 +341,10 @@ const SYSTEM_ONLY_PATTERNS = [
   [/heartbeat/gi, 'status_check'],
   [/SOUL\.md/g, 'PERSONA.md'],
   [/soul\.md/gi, 'persona.md'],
-  [/NO_REPLY/g, 'SKIP_MSG'],
+  // NO_REPLY is OpenClaw's silent-reply sentinel — must pass through verbatim.
+  // Rewriting it broke under SSE streaming: Claude's tokenizer split SKIP_MSG
+  // across content_block_delta events, so per-event reverse-regex couldn't
+  // re-stitch it, and the literal "SKIP_MSG" leaked to chat.
   [/EXFOLIATE/gi, 'PROCESS'],
   [/lobster/gi, 'assistant'],
   [/sessions_spawn/g, 'create_task'],
@@ -748,17 +751,21 @@ function makeRequest(targetUrl, method, headers, payload) {
 }
 
 // Reverse sanitized strings in response text. The model sees sanitized
-// terms in context (STATUS_ACK, SKIP_MSG, STATUSCHECK.md, etc.) and
-// echoes them in its output. Without reversal, OpenClaw gets literal
-// "SKIP_MSG" text and posts it to chat instead of treating it as a
-// silent-reply sentinel. These patterns are the exact inverse of
-// SANITIZE_PATTERNS + SYSTEM_ONLY_PATTERNS applied to outgoing requests.
+// terms in context (STATUS_ACK, STATUSCHECK.md, etc.) and echoes them in
+// its output. Without reversal, OpenClaw gets literal sanitized text
+// instead of the original sentinels/paths. These patterns are the exact
+// inverse of SANITIZE_PATTERNS + SYSTEM_ONLY_PATTERNS applied to outgoing
+// requests.
+//
+// Note: multi-token sentinels are fragile here because Claude's tokenizer
+// can split them across SSE content_block_delta events, defeating the
+// per-event regex. Prefer to NOT rewrite a sentinel in the first place if
+// it's safe to expose to the upstream API.
 const RESPONSE_DESANITIZE_PATTERNS = [
   // System-only patterns (most common in assistant output)
   [/STATUS_ACK/g, 'HEARTBEAT_OK'],
   [/STATUSCHECK\.md/g, 'HEARTBEAT.md'],
   [/STATUS_CHECK/g, 'HEARTBEAT'],
-  [/SKIP_MSG/g, 'NO_REPLY'],
   [/PERSONA\.md/g, 'SOUL.md'],
   // Paths — reverse .clawdata back to .openclaw
   [/\.clawdata\//g, '.openclaw/'],
@@ -776,7 +783,7 @@ function desanitizeResponseString(text) {
 }
 
 // Restore renamed tool names AND sanitized strings in a parsed JSON response.
-// Text content and tool_use inputs may contain sanitized terms (SKIP_MSG,
+// Text content and tool_use inputs may contain sanitized terms (STATUS_ACK,
 // STATUSCHECK.md, etc.) that the model echoed from its context — these need
 // to be reversed before the client sees them. Other string fields (ids,
 // error messages) are left alone.
