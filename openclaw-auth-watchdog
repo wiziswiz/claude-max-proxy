@@ -10,7 +10,11 @@ PLIST="$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"
 LOG="/tmp/openclaw-auth-watchdog.log"
 REPAIRED=0
 GATEWAY_NEEDS_RESTART=0
-NODE=/Users/wizbot/.nvm/versions/node/v22.22.0/bin/node
+NODE="${NODE:-$(command -v node)}"
+if [ -z "$NODE" ]; then
+  log "ERROR: node not found in PATH"
+  exit 1
+fi
 AUTH_PROFILES="$HOME/.openclaw/agents/main/agent/auth-profiles.json"
 
 log() {
