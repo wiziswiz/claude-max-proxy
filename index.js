@@ -42,6 +42,9 @@ const ANTHROPIC_TOKEN_OVERRIDE = process.env.ANTHROPIC_TOKEN || null;
 // causes "invalid x-api-key" 401s. Override with AUTH_HEADER_FORMAT=x-api-key only if
 // using a legacy sk-ant-api03-* key.
 const AUTH_HEADER_FORMAT = (process.env.AUTH_HEADER_FORMAT || 'bearer').toLowerCase();
+const SANITIZE_OPENCLAW = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.SANITIZE_OPENCLAW || '').toLowerCase()
+);
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 const OAUTH_SCOPES = 'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
@@ -374,6 +377,7 @@ const TOOL_RENAMES_REVERSE = Object.fromEntries(
 );
 
 function sanitizeString(text, systemOnly = false) {
+  if (!SANITIZE_OPENCLAW) return text;
   if (typeof text !== 'string') return text;
   for (const [pattern, replacement] of SANITIZE_PATTERNS) {
     text = text.replace(pattern, replacement);
@@ -401,54 +405,58 @@ function sanitizeRequest(body) {
   }
 
   // Sanitize system prompt with extra patterns
-  if (typeof result.system === 'string') {
-    result.system = sanitizeString(result.system, true);
-  } else if (Array.isArray(result.system)) {
-    result.system = result.system.map(block => {
-      if (block?.type === 'text' && typeof block.text === 'string') {
-        return { ...block, text: sanitizeString(block.text, true) };
-      }
-      return block;
-    });
-  }
+  if (SANITIZE_OPENCLAW) {
+    if (typeof result.system === 'string') {
+      result.system = sanitizeString(result.system, true);
+    } else if (Array.isArray(result.system)) {
+      result.system = result.system.map(block => {
+        if (block?.type === 'text' && typeof block.text === 'string') {
+          return { ...block, text: sanitizeString(block.text, true) };
+        }
+        return block;
+      });
+    }
 
-  // Sanitize all message content — but skip tool_result blocks entirely.
-  // Tool results are exec outputs (shell commands, file reads, etc.) and don't
-  // need sanitization for billing detection. Sanitizing them corrupts file paths
-  // and binary names in exec session output, breaking openclaw's self-diagnosis.
-  if (Array.isArray(result.messages)) {
-    result.messages = result.messages.map(msg => {
-      if (typeof msg.content === 'string') {
-        return { ...msg, content: sanitizeString(msg.content) };
-      }
-      if (Array.isArray(msg.content)) {
-        return {
-          ...msg,
-          content: msg.content.map(block => {
-            // Skip tool_result blocks — execution output, not app fingerprints
-            if (block?.type === 'tool_result') return block;
-            if (typeof block === 'string') return sanitizeString(block);
-            if (block && typeof block === 'object') {
-              const newBlock = { ...block };
-              if (typeof newBlock.text === 'string') newBlock.text = sanitizeString(newBlock.text);
-              if (typeof newBlock.content === 'string') newBlock.content = sanitizeString(newBlock.content);
-              // Deep sanitize tool input (handles nested objects like edit new_string)
-              if (newBlock.input && typeof newBlock.input === 'object') {
-                newBlock.input = JSON.parse(sanitizeString(JSON.stringify(newBlock.input)));
+    // Sanitize all message content — but skip tool_result blocks entirely.
+    // Tool results are exec outputs (shell commands, file reads, etc.) and don't
+    // need sanitization for billing detection. Sanitizing them corrupts file paths
+    // and binary names in exec session output, breaking openclaw's self-diagnosis.
+    if (Array.isArray(result.messages)) {
+      result.messages = result.messages.map(msg => {
+        if (typeof msg.content === 'string') {
+          return { ...msg, content: sanitizeString(msg.content) };
+        }
+        if (Array.isArray(msg.content)) {
+          return {
+            ...msg,
+            content: msg.content.map(block => {
+              // Skip tool_result blocks — execution output, not app fingerprints
+              if (block?.type === 'tool_result') return block;
+              if (typeof block === 'string') return sanitizeString(block);
+              if (block && typeof block === 'object') {
+                const newBlock = { ...block };
+                if (typeof newBlock.text === 'string') newBlock.text = sanitizeString(newBlock.text);
+                if (typeof newBlock.content === 'string') newBlock.content = sanitizeString(newBlock.content);
+                // Deep sanitize tool input (handles nested objects like edit new_string)
+                if (newBlock.input && typeof newBlock.input === 'object') {
+                  newBlock.input = JSON.parse(sanitizeString(JSON.stringify(newBlock.input)));
+                }
+                return newBlock;
               }
-              return newBlock;
-            }
-            return block;
-          }),
-        };
-      }
-      return msg;
-    });
+              return block;
+            }),
+          };
+        }
+        return msg;
+      });
+    }
   }
 
   // Sanitize and rename tools
   if (Array.isArray(result.tools)) {
-    result.tools = JSON.parse(sanitizeString(JSON.stringify(result.tools)));
+    if (SANITIZE_OPENCLAW) {
+      result.tools = JSON.parse(sanitizeString(JSON.stringify(result.tools)));
+    }
     result.tools = result.tools.map(tool => ({
       ...tool,
       name: TOOL_RENAMES[tool.name] || tool.name,
@@ -1070,7 +1078,7 @@ app.post('/v1/messages', async (req, res) => {
     })),
   };
   const outgoing = JSON.stringify(checkBody).toLowerCase();
-  const leaks = BLOCKED_TERMS.filter(term => outgoing.includes(term));
+  const leaks = SANITIZE_OPENCLAW ? BLOCKED_TERMS.filter(term => outgoing.includes(term)) : [];
   if (leaks.length > 0) {
     log(`⚠ SANITIZATION LEAK: found [${leaks.join(', ')}] in outgoing request — blocking`);
     res.status(400).json({
@@ -1167,6 +1175,7 @@ app.listen(PORT, '127.0.0.1', () => {
   log(`claude-max-proxy v${require('./package.json').version} (oauth-proxy mode)`);
   log(`Listening on http://127.0.0.1:${PORT}`);
   log(`Proxying → ${ANTHROPIC_BASE} (with CLI OAuth credentials)`);
+  log(`OpenClaw sanitization: ${SANITIZE_OPENCLAW ? 'enabled' : 'disabled'}`);
   log(`Token: ${cachedCredentials ? 'loaded' : 'NOT FOUND — run "claude auth login"'}`);
   if (cachedCredentials) {
     log(`Subscription: ${cachedCredentials.subscriptionType} (${cachedCredentials.rateLimitTier})`);
@@ -1192,5 +1201,5 @@ process.on('SIGINT', () => {
 
 // Exports for testing
 if (require.main !== module) {
-  module.exports = { TOOL_RENAMES, TOOL_RENAMES_REVERSE, desanitizeResponseJson, desanitizeSseLine };
+  module.exports = { TOOL_RENAMES, TOOL_RENAMES_REVERSE, desanitizeResponseJson, desanitizeSseLine, sanitizeRequest };
 }

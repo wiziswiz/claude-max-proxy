@@ -70,6 +70,10 @@ if [ "$(uname)" = "Darwin" ]; then
     <dict>
         <key>PORT</key>
         <string>4523</string>
+        <key>AUTH_HEADER_FORMAT</key>
+        <string>bearer</string>
+        <key>SANITIZE_OPENCLAW</key>
+        <string>0</string>
         <key>HOME</key>
         <string>$USER_HOME</string>
         <key>PATH</key>
@@ -97,6 +101,7 @@ EOF
   sleep 1
 
   launchctl bootstrap gui/$UID "$PLIST"
+  launchctl kickstart -k gui/$UID/com.claude-max-proxy 2>/dev/null || true
   sleep 2
 
   # Verify
@@ -127,6 +132,8 @@ ExecStart=$NODE_BIN $REPO_DIR/index.js
 Restart=on-failure
 RestartSec=5
 Environment=PORT=4523
+Environment=AUTH_HEADER_FORMAT=bearer
+Environment=SANITIZE_OPENCLAW=0
 Environment=HOME=$USER_HOME
 
 [Install]

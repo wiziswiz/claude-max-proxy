@@ -14,9 +14,9 @@ Your App  →  claude-max-proxy :4523  →  api.anthropic.com
 **What the proxy does on each request:**
 1. Reads your OAuth token from `~/.claude/.credentials.json` (or macOS Keychain)
 2. Rewrites the system prompt to match the exact structure Anthropic's billing classifier expects for first-party Claude Code sessions: only `[CC-preamble, billing-header]`. Any extra app context blocks are moved into the first user message as `<system>…</system>` so the model still receives them.
-3. Normalizes app-specific strings and tool names to a standard format
+3. Normalizes OpenClaw tool names in transit and restores them before responses reach OpenClaw
 4. Forwards to Anthropic with your credentials
-5. Streams the response back untouched
+5. Streams the response back after restoring normalized tool names
 
 No separate API key needed. No extra billing. Uses your existing Max subscription.
 
@@ -120,9 +120,11 @@ Also confirm `auth.profiles` contains:
 }
 ```
 
-### OpenClaw: path aliases
+### OpenClaw: optional path aliases
 
-The proxy normalizes certain OpenClaw-specific paths and names in requests. Create symlinks so your system can resolve both the original and normalized versions:
+By default, the proxy leaves OpenClaw text and filesystem paths intact. That is the recommended mode and avoids the path/personality/memory drift caused by rewriting local labels.
+
+If you explicitly enable legacy text/path sanitization with `SANITIZE_OPENCLAW=1`, create symlinks so your system can resolve both the original and normalized versions:
 
 ```bash
 ln -sf ~/.openclaw ~/.clawdata
@@ -131,6 +133,8 @@ ln -sf $(which openclaw) ~/.local/bin/openclaw  # if not already in PATH
 ln -sf ~/clawd/SOUL.md ~/clawd/PERSONA.md
 ln -sf ~/clawd/HEARTBEAT.md ~/clawd/STATUSCHECK.md
 ```
+
+Leave `SANITIZE_OPENCLAW=0` or unset for normal use. Tool-name normalization remains enabled either way.
 
 ## Tool name normalization
 
@@ -153,7 +157,7 @@ Both streaming (SSE) and non-streaming responses are handled. Tool references in
 
 ## What passes through
 
-Everything. The proxy only modifies auth headers and normalizes the request body. Full support for:
+Everything. The proxy modifies auth headers, the billing-compatible system shape, and tool names. Full support for:
 
 - **Tool use** — `tool_use` / `tool_result` blocks pass through with full fidelity; tool names are normalized outbound and restored inbound so OpenClaw always sees original names
 - **Streaming** — SSE events pass through; `data:` payloads containing tool names are rewritten to restore original names before the client receives them
@@ -183,7 +187,8 @@ If credentials are missing: `Run "claude auth login" to re-authenticate`
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Upstream Anthropic endpoint |
 | `CREDENTIALS_PATH` | `~/.claude/.credentials.json` | Path to Claude CLI credentials file |
 | `ANTHROPIC_TOKEN` | *(unset)* | Use this token directly, bypassing credentials file and Keychain |
-| `AUTH_HEADER_FORMAT` | `x-api-key` | Auth header: `x-api-key` (default) or `bearer`. Try `bearer` if you get 401 with a valid token |
+| `AUTH_HEADER_FORMAT` | `bearer` | Auth header: `bearer` for Claude Code OAuth tokens. Use `x-api-key` only for legacy API keys |
+| `SANITIZE_OPENCLAW` | `0` | Set to `1` to enable legacy OpenClaw text/path rewriting. Tool-name normalization remains enabled either way |
 
 ## Endpoints
 
@@ -227,6 +232,10 @@ Create `~/Library/LaunchAgents/com.claude-max-proxy.plist`:
     <dict>
         <key>PORT</key>
         <string>4523</string>
+        <key>AUTH_HEADER_FORMAT</key>
+        <string>bearer</string>
+        <key>SANITIZE_OPENCLAW</key>
+        <string>0</string>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin</string>
     </dict>
@@ -243,7 +252,8 @@ Create `~/Library/LaunchAgents/com.claude-max-proxy.plist`:
 ```
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.claude-max-proxy.plist
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.claude-max-proxy.plist 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-max-proxy.plist
 ```
 
 ### Linux (manual)
@@ -263,6 +273,8 @@ ExecStart=/usr/bin/node /home/YOUR_USER/claude-max-proxy/index.js
 Restart=on-failure
 RestartSec=5
 Environment=PORT=4523
+Environment=AUTH_HEADER_FORMAT=bearer
+Environment=SANITIZE_OPENCLAW=0
 
 [Install]
 WantedBy=multi-user.target
@@ -304,7 +316,7 @@ Anthropic's billing classifier rejected the request as a third-party app rather 
 2. Watch proxy logs while sending a request — you should see `POST /v1/messages`: `tail -f ~/.openclaw/logs/claude-max-proxy.log`
 3. For OpenClaw: verify `openclaw.json` has both `baseUrl` and the `models` array (see App Configuration above)
 
-**Billing classifier detecting third-party identity** — requests go through the proxy but Anthropic still rejects them. This happens when the app adds extra system blocks that reveal its non-Claude-Code identity (e.g. `"You are a personal assistant running on myapp"`). The proxy v2.1+ automatically strips these extra blocks and moves them into the user message, so this should be handled transparently. If you're on an older version, update and restart.
+**Billing classifier detecting third-party identity** — requests go through the proxy but Anthropic still rejects them. First confirm the proxy startup log says it is using Claude Code OAuth credentials and `AUTH_HEADER_FORMAT=bearer`. If that is correct and the error persists, try the legacy fallback `SANITIZE_OPENCLAW=1 node index.js`; this rewrites OpenClaw text/paths, but it is not the recommended default because it can confuse local path, memory, and personality references.
 
 ### HTTP 401 with a valid token
 

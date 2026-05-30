@@ -12,7 +12,7 @@
 const assert = require('assert');
 
 // ── Pull the maps directly from the proxy ────────────────────────────────────
-const { TOOL_RENAMES, TOOL_RENAMES_REVERSE, desanitizeResponseJson, desanitizeSseLine } = require('../index.js');
+const { TOOL_RENAMES, TOOL_RENAMES_REVERSE, desanitizeResponseJson, desanitizeSseLine, sanitizeRequest } = require('../index.js');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function makeToolUseJson(name) {
@@ -141,6 +141,50 @@ test('SSE: unknown tool names pass through unchanged', () => {
   assert.strictEqual(evt.content_block.name, 'some_other_tool');
 });
 
+console.log('\nOpenClaw sanitization switch');
+
+test('sanitizeRequest still renames tools when OpenClaw text sanitization is disabled', () => {
+  const body = sanitizeRequest({
+    system: [{ type: 'text', text: 'OpenClaw uses .openclaw/ and SOUL.md' }],
+    messages: [
+      { role: 'user', content: 'OpenClaw memory_search in .openclaw/' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'sessions_spawn', input: { path: '.openclaw/test' } },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'tu_1', content: 'ok' },
+        ],
+      },
+    ],
+    tools: [
+      { name: 'sessions_spawn', description: 'OpenClaw spawn tool' },
+    ],
+  });
+
+  const textSanitizationEnabled = ['1', 'true', 'yes', 'on'].includes(
+    String(process.env.SANITIZE_OPENCLAW || '').toLowerCase()
+  );
+
+  if (textSanitizationEnabled) {
+    assert.notStrictEqual(body.system[0].text, 'OpenClaw uses .openclaw/ and SOUL.md');
+    assert.notStrictEqual(body.messages[0].content, 'OpenClaw memory_search in .openclaw/');
+  } else {
+    assert.strictEqual(body.system[0].text, 'OpenClaw uses .openclaw/ and SOUL.md');
+    assert.strictEqual(body.messages[0].content, 'OpenClaw memory_search in .openclaw/');
+    assert.strictEqual(body.messages[1].content[0].input.path, '.openclaw/test');
+    assert.strictEqual(body.tools[0].description, 'OpenClaw spawn tool');
+  }
+
+  assert.strictEqual(body.tools[0].name, 'sess_spawn');
+  assert.strictEqual(body.messages[1].content[0].name, 'sess_spawn');
+});
+
 // ── Summary ───────────────────────────────────────────────────────────────────
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
+process.exit(0);
