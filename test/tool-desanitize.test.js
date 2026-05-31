@@ -12,7 +12,16 @@
 const assert = require('assert');
 
 // ── Pull the maps directly from the proxy ────────────────────────────────────
-const { TOOL_RENAMES, TOOL_RENAMES_REVERSE, desanitizeResponseJson, desanitizeSseLine, sanitizeRequest } = require('../index.js');
+const {
+  TOOL_RENAMES,
+  TOOL_RENAMES_REVERSE,
+  COMPACT_TOOL_SCHEMAS,
+  NORMALIZE_TOOL_NAMES,
+  desanitizeResponseJson,
+  desanitizeSseLine,
+  rewriteSystemForBillingClassifier,
+  sanitizeRequest,
+} = require('../index.js');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function makeToolUseJson(name) {
@@ -72,12 +81,13 @@ for (const [orig, renamed] of TOOLS_TO_TEST) {
 
 console.log('\nJSON response desanitization');
 for (const [orig, renamed] of TOOLS_TO_TEST) {
-  test(`JSON: ${renamed} → ${orig}`, () => {
+  test(`JSON: ${renamed} ${NORMALIZE_TOOL_NAMES ? '→ ' + orig : 'passes through'}`, () => {
     const response = makeToolUseJson(renamed);
     const fixed = desanitizeResponseJson(response);
     assert.strictEqual(
-      fixed.content[0].name, orig,
-      `Expected '${orig}', got '${fixed.content[0].name}'`
+      fixed.content[0].name,
+      NORMALIZE_TOOL_NAMES ? orig : renamed,
+      `Expected '${NORMALIZE_TOOL_NAMES ? orig : renamed}', got '${fixed.content[0].name}'`
     );
   });
 }
@@ -86,6 +96,15 @@ test('JSON: non-tool names are not modified', () => {
   const response = { type: 'message', content: [{ type: 'text', text: 'hello' }] };
   const fixed = desanitizeResponseJson(response);
   assert.deepStrictEqual(fixed, response);
+});
+
+test('JSON: response text desanitization follows SANITIZE_OPENCLAW', () => {
+  const response = { type: 'message', content: [{ type: 'text', text: 'PERSONA.md' }] };
+  const fixed = desanitizeResponseJson(response);
+  const textSanitizationEnabled = ['1', 'true', 'yes', 'on'].includes(
+    String(process.env.SANITIZE_OPENCLAW || '').toLowerCase()
+  );
+  assert.strictEqual(fixed.content[0].text, textSanitizationEnabled ? 'SOUL.md' : 'PERSONA.md');
 });
 
 test('JSON: unknown tool names pass through unchanged', () => {
@@ -102,19 +121,20 @@ test('JSON: nested tool_use in array', () => {
     ],
   };
   const fixed = desanitizeResponseJson(response);
-  assert.strictEqual(fixed.content[1].name, 'subagents');
+  assert.strictEqual(fixed.content[1].name, NORMALIZE_TOOL_NAMES ? 'subagents' : 'sub_agents');
   assert.strictEqual(fixed.content[0].text, 'ok');
 });
 
 console.log('\nSSE streaming desanitization');
 for (const [orig, renamed] of TOOLS_TO_TEST) {
-  test(`SSE: ${renamed} → ${orig}`, () => {
+  test(`SSE: ${renamed} ${NORMALIZE_TOOL_NAMES ? '→ ' + orig : 'passes through'}`, () => {
     const line = makeSseLine(renamed);
     const fixed = desanitizeSseLine(line);
     const evt = JSON.parse(fixed.slice(6));
     assert.strictEqual(
-      evt.content_block.name, orig,
-      `Expected '${orig}', got '${evt.content_block.name}'`
+      evt.content_block.name,
+      NORMALIZE_TOOL_NAMES ? orig : renamed,
+      `Expected '${NORMALIZE_TOOL_NAMES ? orig : renamed}', got '${evt.content_block.name}'`
     );
   });
 }
@@ -143,7 +163,7 @@ test('SSE: unknown tool names pass through unchanged', () => {
 
 console.log('\nOpenClaw sanitization switch');
 
-test('sanitizeRequest still renames tools when OpenClaw text sanitization is disabled', () => {
+test('sanitizeRequest preserves text and obeys tool name mode', () => {
   const body = sanitizeRequest({
     system: [{ type: 'text', text: 'OpenClaw uses .openclaw/ and SOUL.md' }],
     messages: [
@@ -162,7 +182,17 @@ test('sanitizeRequest still renames tools when OpenClaw text sanitization is dis
       },
     ],
     tools: [
-      { name: 'sessions_spawn', description: 'OpenClaw spawn tool' },
+      {
+        name: 'sessions_spawn',
+        description: 'OpenClaw spawn tool',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'OpenClaw path' },
+          },
+          required: ['path'],
+        },
+      },
     ],
   });
 
@@ -177,11 +207,53 @@ test('sanitizeRequest still renames tools when OpenClaw text sanitization is dis
     assert.strictEqual(body.system[0].text, 'OpenClaw uses .openclaw/ and SOUL.md');
     assert.strictEqual(body.messages[0].content, 'OpenClaw memory_search in .openclaw/');
     assert.strictEqual(body.messages[1].content[0].input.path, '.openclaw/test');
-    assert.strictEqual(body.tools[0].description, 'OpenClaw spawn tool');
+    assert.strictEqual(
+      body.tools[0].description,
+      COMPACT_TOOL_SCHEMAS
+        ? `Use the ${NORMALIZE_TOOL_NAMES ? 'sess spawn' : 'sessions spawn'} tool.`
+        : 'OpenClaw spawn tool'
+    );
   }
 
-  assert.strictEqual(body.tools[0].name, 'sess_spawn');
-  assert.strictEqual(body.messages[1].content[0].name, 'sess_spawn');
+  assert.strictEqual(body.tools[0].name, NORMALIZE_TOOL_NAMES ? 'sess_spawn' : 'sessions_spawn');
+  assert.strictEqual(body.messages[1].content[0].name, NORMALIZE_TOOL_NAMES ? 'sess_spawn' : 'sessions_spawn');
+  assert.strictEqual(
+    body.tools[0].input_schema.properties.path.description,
+    COMPACT_TOOL_SCHEMAS ? undefined : (textSanitizationEnabled ? 'myapp path' : 'OpenClaw path')
+  );
+});
+
+console.log('\nSystem rewrite');
+
+test('rewriteSystemForBillingClassifier does not prepend system context before tool_result blocks', () => {
+  const body = rewriteSystemForBillingClassifier({
+    system: [
+      { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." },
+      { type: 'text', text: 'x-anthropic-billing-header: old' },
+      { type: 'text', text: 'extra app context' },
+    ],
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'toolu_test', name: 'message', input: {} },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'toolu_test', content: 'ok' },
+        ],
+      },
+      {
+        role: 'user',
+        content: 'next real user message',
+      },
+    ],
+  });
+
+  assert.strictEqual(body.messages[1].content[0].type, 'tool_result');
+  assert.match(body.messages[2].content, /^<system>/);
 });
 
 // ── Summary ───────────────────────────────────────────────────────────────────

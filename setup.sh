@@ -74,6 +74,10 @@ if [ "$(uname)" = "Darwin" ]; then
         <string>bearer</string>
         <key>SANITIZE_OPENCLAW</key>
         <string>0</string>
+        <key>TOOL_NAME_MODE</key>
+        <string>normalize</string>
+        <key>TOOL_SCHEMA_MODE</key>
+        <string>compact</string>
         <key>HOME</key>
         <string>$USER_HOME</string>
         <key>PATH</key>
@@ -134,6 +138,8 @@ RestartSec=5
 Environment=PORT=4523
 Environment=AUTH_HEADER_FORMAT=bearer
 Environment=SANITIZE_OPENCLAW=0
+Environment=TOOL_NAME_MODE=normalize
+Environment=TOOL_SCHEMA_MODE=compact
 Environment=HOME=$USER_HOME
 
 [Install]

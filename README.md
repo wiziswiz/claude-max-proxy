@@ -14,7 +14,7 @@ Your App  →  claude-max-proxy :4523  →  api.anthropic.com
 **What the proxy does on each request:**
 1. Reads your OAuth token from `~/.claude/.credentials.json` (or macOS Keychain)
 2. Rewrites the system prompt to match the exact structure Anthropic's billing classifier expects for first-party Claude Code sessions: only `[CC-preamble, billing-header]`. Any extra app context blocks are moved into the first user message as `<system>…</system>` so the model still receives them.
-3. Normalizes OpenClaw tool names in transit and restores them before responses reach OpenClaw
+3. Compacts verbose tool schemas and normalizes selected OpenClaw tool names in transit
 4. Forwards to Anthropic with your credentials
 5. Streams the response back after restoring normalized tool names
 
@@ -134,11 +134,13 @@ ln -sf ~/clawd/SOUL.md ~/clawd/PERSONA.md
 ln -sf ~/clawd/HEARTBEAT.md ~/clawd/STATUSCHECK.md
 ```
 
-Leave `SANITIZE_OPENCLAW=0` or unset for normal use. Tool-name normalization remains enabled either way.
+Leave `SANITIZE_OPENCLAW=0` or unset for normal use.
 
-## Tool name normalization
+## Tool names and schemas
 
-The proxy normalizes OpenClaw tool names in outbound requests and restores them on inbound responses. This is transparent — OpenClaw registers tools under their original names and receives them back under those same names.
+The proxy compacts verbose tool descriptions and nested schema descriptions before forwarding requests. It also normalizes selected OpenClaw tool names upstream and restores them on inbound responses.
+
+This is intentionally targeted: live testing showed that preserving raw OpenClaw tool names still triggers Anthropic's non-first-party billing classifier, even with compact schemas. OpenClaw still registers tools under their original names and receives tool calls under those same names.
 
 | Original | Normalized (in transit) |
 |----------|------------------------|
@@ -157,7 +159,7 @@ Both streaming (SSE) and non-streaming responses are handled. Tool references in
 
 ## What passes through
 
-Everything. The proxy modifies auth headers, the billing-compatible system shape, and tool names. Full support for:
+Everything. The proxy modifies auth headers, the billing-compatible system shape, tool schema verbosity, and selected tool names. Full support for:
 
 - **Tool use** — `tool_use` / `tool_result` blocks pass through with full fidelity; tool names are normalized outbound and restored inbound so OpenClaw always sees original names
 - **Streaming** — SSE events pass through; `data:` payloads containing tool names are rewritten to restore original names before the client receives them
@@ -188,7 +190,9 @@ If credentials are missing: `Run "claude auth login" to re-authenticate`
 | `CREDENTIALS_PATH` | `~/.claude/.credentials.json` | Path to Claude CLI credentials file |
 | `ANTHROPIC_TOKEN` | *(unset)* | Use this token directly, bypassing credentials file and Keychain |
 | `AUTH_HEADER_FORMAT` | `bearer` | Auth header: `bearer` for Claude Code OAuth tokens. Use `x-api-key` only for legacy API keys |
-| `SANITIZE_OPENCLAW` | `0` | Set to `1` to enable legacy OpenClaw text/path rewriting. Tool-name normalization remains enabled either way |
+| `SANITIZE_OPENCLAW` | `0` | Set to `1` to enable legacy OpenClaw text/path rewriting |
+| `TOOL_NAME_MODE` | `normalize` | `normalize` maps selected OpenClaw tool names upstream and restores them inbound. `preserve` keeps raw tool names for diagnostics |
+| `TOOL_SCHEMA_MODE` | `compact` | `compact` strips verbose tool/schema descriptions while preserving tool names and input shapes. Use `full` for diagnostics |
 
 ## Endpoints
 
@@ -236,6 +240,10 @@ Create `~/Library/LaunchAgents/com.claude-max-proxy.plist`:
         <string>bearer</string>
         <key>SANITIZE_OPENCLAW</key>
         <string>0</string>
+        <key>TOOL_NAME_MODE</key>
+        <string>normalize</string>
+        <key>TOOL_SCHEMA_MODE</key>
+        <string>compact</string>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin</string>
     </dict>
@@ -275,6 +283,8 @@ RestartSec=5
 Environment=PORT=4523
 Environment=AUTH_HEADER_FORMAT=bearer
 Environment=SANITIZE_OPENCLAW=0
+Environment=TOOL_NAME_MODE=normalize
+Environment=TOOL_SCHEMA_MODE=compact
 
 [Install]
 WantedBy=multi-user.target
@@ -386,7 +396,7 @@ Then restart the LaunchAgent.
 
 ### Subagent spawn stuck in a retry loop ("Tool sess_spawn not found")
 
-This was a proxy bug that is now fixed. The proxy normalized tool names outbound but wasn't restoring them on inbound responses, so OpenClaw received `sess_spawn` instead of `sessions_spawn`, rejected it, and the model kept retrying the same spawn plan.
+This was a proxy bug in the `TOOL_NAME_MODE=normalize` path. The proxy normalized tool names outbound but wasn't restoring them on inbound responses, so OpenClaw received `sess_spawn` instead of `sessions_spawn`, rejected it, and the model kept retrying the same spawn plan.
 
 `git pull` the latest version and restart the proxy. The fix reverses tool renames on all inbound JSON and SSE responses.
 

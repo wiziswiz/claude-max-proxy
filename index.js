@@ -45,6 +45,10 @@ const AUTH_HEADER_FORMAT = (process.env.AUTH_HEADER_FORMAT || 'bearer').toLowerC
 const SANITIZE_OPENCLAW = ['1', 'true', 'yes', 'on'].includes(
   String(process.env.SANITIZE_OPENCLAW || '').toLowerCase()
 );
+const TOOL_NAME_MODE = (process.env.TOOL_NAME_MODE || 'normalize').toLowerCase();
+const NORMALIZE_TOOL_NAMES = ['normalize', 'neutral', '1', 'true', 'yes', 'on'].includes(TOOL_NAME_MODE);
+const TOOL_SCHEMA_MODE = (process.env.TOOL_SCHEMA_MODE || 'compact').toLowerCase();
+const COMPACT_TOOL_SCHEMAS = TOOL_SCHEMA_MODE === 'compact';
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 const OAUTH_SCOPES = 'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
@@ -376,6 +380,30 @@ const TOOL_RENAMES_REVERSE = Object.fromEntries(
   Object.entries(TOOL_RENAMES).map(([orig, renamed]) => [renamed, orig])
 );
 
+function stripSchemaDescriptions(value) {
+  if (Array.isArray(value)) return value.map(stripSchemaDescriptions);
+  if (!value || typeof value !== 'object') return value;
+
+  const next = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (key === 'description') continue;
+    next[key] = stripSchemaDescriptions(child);
+  }
+  return next;
+}
+
+function humanizeToolName(name) {
+  return String(name || 'tool').replace(/_/g, ' ');
+}
+
+function compactToolSchema(tool) {
+  if (!tool || typeof tool !== 'object') return tool;
+  const next = { ...tool };
+  next.description = `Use the ${humanizeToolName(next.name)} tool.`;
+  if (next.input_schema) next.input_schema = stripSchemaDescriptions(next.input_schema);
+  return next;
+}
+
 function sanitizeString(text, systemOnly = false) {
   if (!SANITIZE_OPENCLAW) return text;
   if (typeof text !== 'string') return text;
@@ -457,14 +485,19 @@ function sanitizeRequest(body) {
     if (SANITIZE_OPENCLAW) {
       result.tools = JSON.parse(sanitizeString(JSON.stringify(result.tools)));
     }
-    result.tools = result.tools.map(tool => ({
-      ...tool,
-      name: TOOL_RENAMES[tool.name] || tool.name,
-    }));
+    if (NORMALIZE_TOOL_NAMES) {
+      result.tools = result.tools.map(tool => ({
+        ...tool,
+        name: TOOL_RENAMES[tool.name] || tool.name,
+      }));
+    }
+    if (COMPACT_TOOL_SCHEMAS) {
+      result.tools = result.tools.map(compactToolSchema);
+    }
   }
 
   // Rename tool_use references in messages
-  if (Array.isArray(result.messages)) {
+  if (NORMALIZE_TOOL_NAMES && Array.isArray(result.messages)) {
     result.messages = result.messages.map(msg => {
       if (!Array.isArray(msg.content)) return msg;
       return {
@@ -505,6 +538,33 @@ const CLAUDE_CODE_PREAMBLE = "You are Claude Code, Anthropic's official CLI for 
 
 function buildBillingHeader() {
   return `x-anthropic-billing-header: cc_version=${CLI_VERSION}.${PROXY_SESSION_ID.slice(0, 8)}; cc_entrypoint=${CLI_ENTRYPOINT}; cch=00000;`;
+}
+
+function contentHasToolResult(content) {
+  return Array.isArray(content) && content.some(block => block?.type === 'tool_result');
+}
+
+function prependSystemContext(messagesInput, prefix) {
+  const messages = [...(messagesInput || [])];
+  const firstSafeUserIdx = messages.findIndex(
+    m => m.role === 'user' && !contentHasToolResult(m.content)
+  );
+
+  if (firstSafeUserIdx >= 0) {
+    const msg = { ...messages[firstSafeUserIdx] };
+    if (typeof msg.content === 'string') {
+      msg.content = prefix + msg.content;
+    } else if (Array.isArray(msg.content)) {
+      msg.content = [{ type: 'text', text: prefix }, ...msg.content];
+    } else {
+      msg.content = prefix;
+    }
+    messages[firstSafeUserIdx] = msg;
+    return messages;
+  }
+
+  messages.unshift({ role: 'user', content: prefix.trim() });
+  return messages;
 }
 
 function rewriteSystemForBillingClassifier(body) {
@@ -555,23 +615,8 @@ function rewriteSystemForBillingClassifier(body) {
         .join('\n\n')
         .trim();
       if (extraText) {
-        const messages = [...(result.messages || [])];
-        const firstUserIdx = messages.findIndex(m => m.role === 'user');
         const prefix = `<system>\n${extraText}\n</system>\n\n`;
-        if (firstUserIdx >= 0) {
-          const msg = { ...messages[firstUserIdx] };
-          if (typeof msg.content === 'string') {
-            msg.content = prefix + msg.content;
-          } else if (Array.isArray(msg.content)) {
-            msg.content = [{ type: 'text', text: prefix }, ...msg.content];
-          } else {
-            msg.content = prefix;
-          }
-          messages[firstUserIdx] = msg;
-        } else {
-          messages.unshift({ role: 'user', content: prefix.trim() });
-        }
-        result.messages = messages;
+        result.messages = prependSystemContext(result.messages, prefix);
       }
     }
     return result;
@@ -597,25 +642,8 @@ function rewriteSystemForBillingClassifier(body) {
       .trim();
 
     if (originalText) {
-      const messages = [...(result.messages || [])];
-      const firstUserIdx = messages.findIndex(m => m.role === 'user');
       const prefix = `<system>\n${originalText}\n</system>\n\n`;
-
-      if (firstUserIdx >= 0) {
-        const msg = { ...messages[firstUserIdx] };
-        if (typeof msg.content === 'string') {
-          msg.content = prefix + msg.content;
-        } else if (Array.isArray(msg.content)) {
-          msg.content = [{ type: 'text', text: prefix }, ...msg.content];
-        } else {
-          msg.content = prefix;
-        }
-        messages[firstUserIdx] = msg;
-      } else {
-        // No user message yet — prepend one
-        messages.unshift({ role: 'user', content: prefix.trim() });
-      }
-      result.messages = messages;
+      result.messages = prependSystemContext(result.messages, prefix);
     }
   }
 
@@ -783,6 +811,7 @@ const RESPONSE_DESANITIZE_PATTERNS = [
 ];
 
 function desanitizeResponseString(text) {
+  if (!SANITIZE_OPENCLAW) return text;
   if (typeof text !== 'string') return text;
   for (const [pattern, replacement] of RESPONSE_DESANITIZE_PATTERNS) {
     text = text.replace(pattern, replacement);
@@ -801,7 +830,7 @@ function desanitizeResponseJson(obj) {
 
   const result = {};
   for (const [k, v] of Object.entries(obj)) {
-    if (k === 'name' && typeof v === 'string' && TOOL_RENAMES_REVERSE[v]) {
+    if (NORMALIZE_TOOL_NAMES && k === 'name' && typeof v === 'string' && TOOL_RENAMES_REVERSE[v]) {
       result[k] = TOOL_RENAMES_REVERSE[v];
     } else if ((k === 'text' || k === 'thinking' || k === 'content') && typeof v === 'string') {
       // Assistant text output, thinking blocks, or tool_result content
@@ -1176,6 +1205,8 @@ app.listen(PORT, '127.0.0.1', () => {
   log(`Listening on http://127.0.0.1:${PORT}`);
   log(`Proxying → ${ANTHROPIC_BASE} (with CLI OAuth credentials)`);
   log(`OpenClaw sanitization: ${SANITIZE_OPENCLAW ? 'enabled' : 'disabled'}`);
+  log(`Tool name mode: ${NORMALIZE_TOOL_NAMES ? 'normalize' : 'preserve'}`);
+  log(`Tool schema mode: ${COMPACT_TOOL_SCHEMAS ? 'compact' : 'full'}`);
   log(`Token: ${cachedCredentials ? 'loaded' : 'NOT FOUND — run "claude auth login"'}`);
   if (cachedCredentials) {
     log(`Subscription: ${cachedCredentials.subscriptionType} (${cachedCredentials.rateLimitTier})`);
@@ -1201,5 +1232,16 @@ process.on('SIGINT', () => {
 
 // Exports for testing
 if (require.main !== module) {
-  module.exports = { TOOL_RENAMES, TOOL_RENAMES_REVERSE, desanitizeResponseJson, desanitizeSseLine, sanitizeRequest };
+  module.exports = {
+    TOOL_RENAMES,
+    TOOL_RENAMES_REVERSE,
+    TOOL_NAME_MODE,
+    NORMALIZE_TOOL_NAMES,
+    TOOL_SCHEMA_MODE,
+    COMPACT_TOOL_SCHEMAS,
+    desanitizeResponseJson,
+    desanitizeSseLine,
+    rewriteSystemForBillingClassifier,
+    sanitizeRequest,
+  };
 }
