@@ -211,7 +211,9 @@ If credentials are missing: `Run "claude auth login" to re-authenticate`
 ./setup.sh
 ```
 
-This installs the proxy as a background service, sets up auto-start on login, and installs the watchdog cron that monitors and auto-repairs the configuration hourly.
+This installs the proxy as a background service, sets up auto-start on login, and installs the watchdog cron that monitors and auto-repairs the configuration every 15 minutes.
+
+The setup script does **not** install the optional direct Telegram repair trigger by default. That trigger is separate from your normal OpenClaw Telegram bot and is only useful if you want to DM `/watchdog` or `/fix` directly to a tiny standalone repair poller.
 
 ### macOS (manual)
 
@@ -297,7 +299,7 @@ sudo systemctl enable --now claude-max-proxy
 
 ## Watchdog
 
-The included `openclaw-auth-watchdog` script runs hourly and automatically repairs common configuration issues before they cause downtime:
+The included `openclaw-auth-watchdog` script runs periodically and automatically repairs common configuration issues before they cause downtime:
 
 1. Verifies `anthropic:claude-cli` profile is present in `openclaw.json`
 2. Verifies `ANTHROPIC_BASE_URL` is set in the gateway LaunchAgent plist
@@ -310,10 +312,37 @@ Install manually:
 ```bash
 cp openclaw-auth-watchdog ~/bin/openclaw-auth-watchdog
 chmod +x ~/bin/openclaw-auth-watchdog
-(crontab -l 2>/dev/null; echo "0 * * * * $HOME/bin/openclaw-auth-watchdog >> /tmp/openclaw-auth-watchdog.log 2>&1") | crontab -
+(crontab -l 2>/dev/null; echo "*/15 * * * * $HOME/bin/openclaw-auth-watchdog >> /tmp/openclaw-auth-watchdog.log 2>&1") | crontab -
 ```
 
 Or just run `./setup.sh` which does this automatically.
+
+### Optional Telegram repair trigger
+
+The repo includes `telegram-watchdog-trigger.js`, a small standalone Telegram poller that can run `~/bin/openclaw-auth-watchdog` when an allowed chat sends `/watchdog` or `/fix`.
+
+This is disabled by default because most OpenClaw installs do not have the extra allowlist file it needs. Installing it without Telegram config would create a crash loop.
+
+To install it intentionally:
+
+```bash
+INSTALL_TELEGRAM_TRIGGER=1 ./setup.sh
+```
+
+It needs either both environment variables:
+
+```bash
+BOT_TOKEN=123:abc ALLOWED_CHAT_ID=123456 INSTALL_TELEGRAM_TRIGGER=1 ./setup.sh
+```
+
+or these OpenClaw files:
+
+```text
+~/.openclaw/clawdbot.json
+~/.openclaw/credentials/telegram-allowFrom.json
+```
+
+If you previously installed the trigger by accident, rerun plain `./setup.sh`. The installer will remove the old trigger service unless `INSTALL_TELEGRAM_TRIGGER=1` is set.
 
 ## Troubleshooting
 
