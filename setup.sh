@@ -76,6 +76,7 @@ if [ "$(uname)" = "Darwin" ]; then
     <string>$REPO_DIR</string>
     <key>EnvironmentVariables</key>
     <dict>
+        <!-- Optional: set PROXY_SECRET for a stable bearer secret; otherwise the generated value is printed at startup. -->
         <key>PORT</key>
         <string>4523</string>
         <key>AUTH_HEADER_FORMAT</key>
@@ -143,6 +144,7 @@ WorkingDirectory=$REPO_DIR
 ExecStart=$NODE_BIN $REPO_DIR/index.js
 Restart=on-failure
 RestartSec=5
+# Optional: set PROXY_SECRET for a stable bearer secret; otherwise the generated value is printed at startup.
 Environment=PORT=4523
 Environment=AUTH_HEADER_FORMAT=bearer
 Environment=SANITIZE_OPENCLAW=0

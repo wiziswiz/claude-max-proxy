@@ -52,7 +52,9 @@ const COMPACT_TOOL_SCHEMAS = TOOL_SCHEMA_MODE === 'compact';
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 const OAUTH_SCOPES = 'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
-const { randomUUID } = require('crypto');
+const { randomBytes, randomUUID, timingSafeEqual } = require('crypto');
+const GENERATED_PROXY_SECRET = !process.env.PROXY_SECRET;
+const PROXY_SECRET = process.env.PROXY_SECRET || randomBytes(32).toString('hex');
 let PROXY_SESSION_ID = randomUUID();
 
 function log(...args) {
@@ -1059,11 +1061,27 @@ function forwardRequest(req, res, body) {
 // Routes
 // ---------------------------------------------------------------------------
 
+function requireSecret(req, res, next) {
+  const auth = req.headers['authorization'] || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  // Use timingSafeEqual to prevent timing attacks
+  let ok = false;
+  try {
+    const a = Buffer.from(token);
+    const b = Buffer.from(PROXY_SECRET);
+    ok = a.length === b.length && timingSafeEqual(a, b);
+  } catch {}
+  if (!ok) {
+    return res.status(401).json({ type: 'error', error: { type: 'unauthorized', message: 'Invalid or missing Authorization: Bearer <PROXY_SECRET>' } });
+  }
+  next();
+}
+
 // Parse JSON body for POST requests
 app.use(express.json({ limit: '50mb' }));
 
 // POST /v1/messages — main proxy endpoint (sanitize + forward)
-app.post('/v1/messages', async (req, res) => {
+app.post('/v1/messages', requireSecret, async (req, res) => {
   const sanitizedBody = rewriteSystemForBillingClassifier(sanitizeRequest(req.body));
 
   const model = sanitizedBody.model || '?';
@@ -1132,7 +1150,7 @@ app.post('/v1/messages', async (req, res) => {
 });
 
 // Forward other known /v1 endpoints
-app.get('/v1/models', async (req, res) => {
+app.get('/v1/models', requireSecret, async (req, res) => {
   debug(`→ ${req.method} ${req.path}`);
   const body = req.method === 'GET' || req.method === 'HEAD' ? null : req.body;
   await forwardRequest(req, res, body);
@@ -1170,7 +1188,7 @@ app.get('/health', async (req, res) => {
 
 // POST /force-refresh — force immediate token refresh regardless of expiry
 // Useful when Anthropic invalidates the token server-side before local expiry
-app.post('/force-refresh', async (req, res) => {
+app.post('/force-refresh', requireSecret, async (req, res) => {
   try {
     log('Force refresh requested');
     if (!cachedCredentials?.refreshToken) {
@@ -1203,6 +1221,8 @@ scheduleProactiveRefresh();
 app.listen(PORT, '127.0.0.1', () => {
   log(`claude-max-proxy v${require('./package.json').version} (oauth-proxy mode)`);
   log(`Listening on http://127.0.0.1:${PORT}`);
+  if (GENERATED_PROXY_SECRET) log('Proxy secret: ' + PROXY_SECRET);
+  log('  Set header: Authorization: Bearer ' + PROXY_SECRET);
   log(`Proxying → ${ANTHROPIC_BASE} (with CLI OAuth credentials)`);
   log(`OpenClaw sanitization: ${SANITIZE_OPENCLAW ? 'enabled' : 'disabled'}`);
   log(`Tool name mode: ${NORMALIZE_TOOL_NAMES ? 'normalize' : 'preserve'}`);
@@ -1215,7 +1235,7 @@ app.listen(PORT, '127.0.0.1', () => {
   log('');
   log('Configure your app to use:');
   log(`  Base URL: http://127.0.0.1:${PORT}`);
-  log('  API Key:  any non-empty string (auth is handled by OAuth token)');
+  log('  Authorization: Bearer ' + PROXY_SECRET);
   log('');
   if (DEBUG) log('Debug mode enabled');
 });
@@ -1243,5 +1263,6 @@ if (require.main !== module) {
     desanitizeSseLine,
     rewriteSystemForBillingClassifier,
     sanitizeRequest,
+    requireSecret,
   };
 }

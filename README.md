@@ -364,7 +364,8 @@ Try `AUTH_HEADER_FORMAT=bearer node index.js` — some macOS Keychain-sourced to
 If that doesn't help, force a token refresh:
 
 ```bash
-curl -X POST http://127.0.0.1:4523/force-refresh
+curl -X POST http://127.0.0.1:4523/force-refresh \
+  -H "Authorization: Bearer $PROXY_SECRET"
 ```
 
 ### OpenClaw: auth config wiped after `openclaw configure`
@@ -440,6 +441,7 @@ OpenClaw caches auth failures and won't retry a profile until the cooldown expir
 - Binds to `127.0.0.1` only — not accessible from the network
 - Credentials file accessed with owner-only permissions
 - No tokens are logged, even in debug mode
+- A random bearer secret is generated at startup and logged once. Set it as `PROXY_SECRET` env var for a stable value. Every request to `/v1/messages`, `/v1/models`, and `/force-refresh` must include `Authorization: Bearer <secret>`. The `/health` endpoint remains open for monitoring.
 - Do not expose this proxy on a public interface
 
 ## License

@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "test": "node test/tool-desanitize.test.js"
+    "test": "node test/tool-desanitize.test.js && node test/auth.test.js"
   },
   "keywords": [
     "claude",
