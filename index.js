@@ -56,8 +56,38 @@ const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 const OAUTH_SCOPES = 'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
 const { randomBytes, randomUUID, timingSafeEqual } = require('crypto');
-const GENERATED_PROXY_SECRET = !process.env.PROXY_SECRET;
-const PROXY_SECRET = process.env.PROXY_SECRET || randomBytes(32).toString('hex');
+
+// Proxy secret resolution order:
+//   1. PROXY_SECRET env var (explicit override)
+//   2. ~/.claude-max-proxy-secret — persisted by setup.sh (0600) so the
+//      service, the watchdog, and client configs all share one stable secret
+//   3. generate-and-print (printed once at startup; ephemeral across restarts)
+const PROXY_SECRET_FILE = join(homedir(), '.claude-max-proxy-secret');
+
+function readPersistedProxySecret() {
+  try {
+    const raw = readFileSync(PROXY_SECRET_FILE, 'utf-8').trim();
+    if (raw) return raw;
+  } catch {}
+  return null;
+}
+
+let PROXY_SECRET;
+let PROXY_SECRET_SOURCE; // 'env' | 'file' | 'generated'
+if (process.env.PROXY_SECRET) {
+  PROXY_SECRET = process.env.PROXY_SECRET;
+  PROXY_SECRET_SOURCE = 'env';
+} else {
+  // Skip the file fallback under PROXY_TEST so tests stay hermetic.
+  const persisted = process.env.PROXY_TEST ? null : readPersistedProxySecret();
+  if (persisted) {
+    PROXY_SECRET = persisted;
+    PROXY_SECRET_SOURCE = 'file';
+  } else {
+    PROXY_SECRET = randomBytes(32).toString('hex');
+    PROXY_SECRET_SOURCE = 'generated';
+  }
+}
 let PROXY_SESSION_ID = randomUUID();
 
 function log(...args) {
@@ -867,10 +897,25 @@ function makeRequest(targetUrl, method, headers, payload) {
       }
       resolve({ retry: false, proxyRes });
     });
-    // Connect timeout — abort if TCP connection is not established promptly.
+    // Connect timeout — abort if the TCP/TLS connection is not established
+    // promptly. Cleared as soon as the socket is connected (NOT on first byte):
+    // a connected upstream that is slow to produce its first byte — e.g. a
+    // long-thinking Claude request — must not be killed by this timer.
+    // Post-connect inactivity is covered by the response timeout below.
     const connectTimer = setTimeout(() => {
       proxyReq.destroy(new Error(`Connect timeout after ${CONNECT_TIMEOUT_MS}ms`));
     }, CONNECT_TIMEOUT_MS);
+    const clearConnectTimer = () => clearTimeout(connectTimer);
+    proxyReq.on('socket', (socket) => {
+      if (socket.connecting) {
+        // New socket: wait for the handshake to complete (TLS sockets emit
+        // 'secureConnect' after the TLS handshake; plain sockets 'connect').
+        socket.once(socket.encrypted ? 'secureConnect' : 'connect', clearConnectTimer);
+      } else {
+        // Reused keep-alive socket — already connected, nothing to time.
+        clearConnectTimer();
+      }
+    });
     // Response timeout — abort if the upstream socket is inactive for too long.
     proxyReq.setTimeout(RESPONSE_TIMEOUT_MS, () => {
       proxyReq.destroy(new Error(`Response timeout after ${RESPONSE_TIMEOUT_MS}ms`));
@@ -1004,178 +1049,210 @@ async function forwardRequest(req, res, body, dependencies = {}) {
     return;
   }
 
-  let accessToken;
+  // If the circuit is half-open, this request was admitted as the single
+  // probe. Every path below MUST reach a terminal circuit outcome — otherwise
+  // the probe slot leaks and the circuit wedges at 503 until restart.
+  // Semantics:
+  //   - any non-401 upstream RESPONSE (even 4xx) proves auth works → close
+  //   - terminal 401 → failure (reopen)
+  //   - token/transport errors (no auth evidence either way) → release the
+  //     probe slot but leave the circuit state untouched so the next request
+  //     re-probes (handled by the finally below)
+  const holdingProbe = circuit.state === 'half-open';
+  let circuitOutcomeRecorded = false;
+  const recordCircuitSuccess = () => { circuitOutcomeRecorded = true; circuitSuccess(); };
+  const recordCircuitFailure = () => { circuitOutcomeRecorded = true; circuitFailure(); };
   try {
-    accessToken = await getToken();
-  } catch (err) {
-    log('Auth error:', err.message);
-    res.status(401).json({
-      type: 'error',
-      error: {
-        type: 'proxy_auth_error',
-        message: err.message,
-        action: 'Run "claude auth login" to re-authenticate',
-      },
-    });
-    return;
-  }
 
-  const targetUrl = new URL(req.path, ANTHROPIC_BASE);
-  if (req.url.includes('?')) {
-    targetUrl.search = req.url.split('?')[1];
-  }
-
-  let headers = buildHeaders(accessToken, req);
-
-  const payload = body ? JSON.stringify(body) : undefined;
-  if (payload) {
-    headers['content-length'] = Buffer.byteLength(payload);
-  }
-
-  // Retry loop for transient 429s
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    debug(`→ ${req.method} ${targetUrl.toString()} (attempt ${attempt + 1})`);
-
-    let result;
+    let accessToken;
     try {
-      result = await request(targetUrl, req.method, { ...headers }, payload);
+      accessToken = await getToken();
     } catch (err) {
-      log('Proxy request error:', err.message);
-      if (!res.headersSent) {
-        // Distinguish upstream timeouts (504) from other transport errors (502)
-        if (err.message.includes('timeout')) {
-          res.status(504).json({
-            type: 'error',
-            error: { type: 'gateway_timeout', message: `Upstream timeout: ${err.message}` },
-          });
-        } else {
-          res.status(502).json({
-            type: 'error',
-            error: { type: 'api_error', message: `Proxy error: ${err.message}` },
-          });
-        }
-      }
+      log('Auth error:', err.message);
+      res.status(401).json({
+        type: 'error',
+        error: {
+          type: 'proxy_auth_error',
+          message: err.message,
+          action: 'Run "claude auth login" to re-authenticate',
+        },
+      });
       return;
     }
 
-    if (result.retry401) {
-      // Anthropic's token invalidation has eventual consistency — freshly
-      // refreshed tokens can be rejected for 30-60s while edge servers sync.
-      // Strategy: refresh + rotate session on first 401, then backoff retries.
-      // Circuit breaker trips after THRESHOLD consecutive total failures.
-      if (attempt === 0) {
-        // First 401: refresh token + rotate session ID
-        log(`[401] attempt=1 — refreshing + rotating session`);
-        try {
-          accessToken = await refreshAuth();
-          headers = buildHeaders(accessToken, req);
-          if (payload) headers['content-length'] = Buffer.byteLength(payload);
-          log(`[401] retry: refreshed — new_session=${PROXY_SESSION_ID.slice(0, 8)}`);
-        } catch (err) {
-          log(`[401] token refresh failed: ${err.message}`);
-          circuitFailure();
-          res.status(401).json(parseUpstreamErrorBody(result.body, 401));
-          return;
+    const targetUrl = new URL(req.path, ANTHROPIC_BASE);
+    if (req.url.includes('?')) {
+      targetUrl.search = req.url.split('?')[1];
+    }
+
+    let headers = buildHeaders(accessToken, req);
+
+    const payload = body ? JSON.stringify(body) : undefined;
+    if (payload) {
+      headers['content-length'] = Buffer.byteLength(payload);
+    }
+
+    // Retry loop for transient 429s
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      debug(`→ ${req.method} ${targetUrl.toString()} (attempt ${attempt + 1})`);
+
+      let result;
+      try {
+        result = await request(targetUrl, req.method, { ...headers }, payload);
+      } catch (err) {
+        log('Proxy request error:', err.message);
+        if (!res.headersSent) {
+          // Distinguish upstream timeouts (504) from other transport errors
+          // (502). Classify by error code (ETIMEDOUT never contains the word
+          // "timeout") or a case-insensitive message match (covers our own
+          // "Connect timeout ..." / "Response timeout ..." destroy reasons).
+          const isTimeout = err.code === 'ETIMEDOUT'
+            || err.code === 'ESOCKETTIMEDOUT'
+            || /timeout/i.test(String(err.message || ''));
+          if (isTimeout) {
+            res.status(504).json({
+              type: 'error',
+              error: { type: 'gateway_timeout', message: `Upstream timeout: ${err.message}` },
+            });
+          } else {
+            res.status(502).json({
+              type: 'error',
+              error: { type: 'api_error', message: `Proxy error: ${err.message}` },
+            });
+          }
         }
-        continue;
+        return;
       }
 
-      if (attempt < MAX_RETRIES) {
-        // Subsequent 401s: token propagation delay — wait and retry
-        const delayMs = RETRY_BASE_MS * Math.pow(2, attempt - 1); // 2s, 4s, 8s
-        log(`[401] attempt=${attempt + 1} — propagation delay, waiting ${delayMs}ms`);
+      if (result.retry401) {
+        // Anthropic's token invalidation has eventual consistency — freshly
+        // refreshed tokens can be rejected for 30-60s while edge servers sync.
+        // Strategy: refresh + rotate session on first 401, then backoff retries.
+        // Circuit breaker trips after THRESHOLD consecutive total failures.
+        if (attempt === 0) {
+          // First 401: refresh token + rotate session ID
+          log(`[401] attempt=1 — refreshing + rotating session`);
+          try {
+            accessToken = await refreshAuth();
+            headers = buildHeaders(accessToken, req);
+            if (payload) headers['content-length'] = Buffer.byteLength(payload);
+            log(`[401] retry: refreshed — new_session=${PROXY_SESSION_ID.slice(0, 8)}`);
+          } catch (err) {
+            log(`[401] token refresh failed: ${err.message}`);
+            recordCircuitFailure();
+            res.status(401).json(parseUpstreamErrorBody(result.body, 401));
+            return;
+          }
+          continue;
+        }
+
+        if (attempt < MAX_RETRIES) {
+          // Subsequent 401s: token propagation delay — wait and retry
+          const delayMs = RETRY_BASE_MS * Math.pow(2, attempt - 1); // 2s, 4s, 8s
+          log(`[401] attempt=${attempt + 1} — propagation delay, waiting ${delayMs}ms`);
+          await sleep(delayMs);
+          continue;
+        }
+
+        // Exhausted all retries — trip the circuit breaker
+        log(`[401] exhausted all retries — tripping circuit breaker (failure #${circuit.failures + 1})`);
+        recordCircuitFailure();
+        res.status(401).json(parseUpstreamErrorBody(result.body, 401));
+        return;
+      }
+
+      if (result.retry && attempt < MAX_RETRIES) {
+        const delayMs = Math.min(
+          result.retryAfterMs || (RETRY_BASE_MS * Math.pow(2, attempt)),
+          MAX_RETRY_AFTER_MS
+        );
+        log(`429 rate limited, retrying in ${delayMs}ms (attempt ${attempt + 2}/${MAX_RETRIES + 1})`);
         await sleep(delayMs);
         continue;
       }
 
-      // Exhausted all retries — trip the circuit breaker
-      log(`[401] exhausted all retries — tripping circuit breaker (failure #${circuit.failures + 1})`);
-      circuitFailure();
-      res.status(401).json(parseUpstreamErrorBody(result.body, 401));
-      return;
-    }
-
-    if (result.retry && attempt < MAX_RETRIES) {
-      const delayMs = Math.min(
-        result.retryAfterMs || (RETRY_BASE_MS * Math.pow(2, attempt)),
-        MAX_RETRY_AFTER_MS
-      );
-      log(`429 rate limited, retrying in ${delayMs}ms (attempt ${attempt + 2}/${MAX_RETRIES + 1})`);
-      await sleep(delayMs);
-      continue;
-    }
-
-    if (result.retry) {
-      // Exhausted retries, return the 429
-      log(`429 rate limited, exhausted ${MAX_RETRIES + 1} attempts`);
-      res.status(429).json(parseUpstreamErrorBody(result.body, 429));
-      return;
-    }
-
-    const { proxyRes } = result;
-    const sc = proxyRes.statusCode;
-    if (sc >= 400) {
-      const overageStatus = proxyRes.headers['anthropic-ratelimit-unified-overage-status'] || '';
-      const overageReason = proxyRes.headers['anthropic-ratelimit-unified-overage-disabled-reason'] || '';
-      const serviceTier = proxyRes.headers['anthropic-ratelimit-unified-tier'] || '';
-      log(`← ERROR ${sc} | overage=${overageStatus} | reason=${overageReason} | tier=${serviceTier}`);
-    }
-    debug(`← ${proxyRes.statusCode} ${proxyRes.statusMessage}`);
-
-    // Copy response headers
-    const skipHeaders = new Set(['transfer-encoding', 'connection', 'keep-alive']);
-    for (const [key, value] of Object.entries(proxyRes.headers)) {
-      if (!skipHeaders.has(key.toLowerCase())) {
-        res.setHeader(key, value);
+      if (result.retry) {
+        // Exhausted retries, return the 429. The upstream responded (rate
+        // limit, not auth failure) — that proves auth works, so close the
+        // circuit / release the probe.
+        log(`429 rate limited, exhausted ${MAX_RETRIES + 1} attempts`);
+        recordCircuitSuccess();
+        res.status(429).json(parseUpstreamErrorBody(result.body, 429));
+        return;
       }
-    }
-    res.status(proxyRes.statusCode);
 
-    // Successful response — reset circuit breaker
-    if (proxyRes.statusCode < 400) circuitSuccess();
+      const { proxyRes } = result;
+      const sc = proxyRes.statusCode;
+      if (sc >= 400) {
+        const overageStatus = proxyRes.headers['anthropic-ratelimit-unified-overage-status'] || '';
+        const overageReason = proxyRes.headers['anthropic-ratelimit-unified-overage-disabled-reason'] || '';
+        const serviceTier = proxyRes.headers['anthropic-ratelimit-unified-tier'] || '';
+        log(`← ERROR ${sc} | overage=${overageStatus} | reason=${overageReason} | tier=${serviceTier}`);
+      }
+      debug(`← ${proxyRes.statusCode} ${proxyRes.statusMessage}`);
 
-    const contentType = proxyRes.headers['content-type'] || '';
-    const isSSE = contentType.includes('text/event-stream');
+      // Copy response headers
+      const skipHeaders = new Set(['transfer-encoding', 'connection', 'keep-alive']);
+      for (const [key, value] of Object.entries(proxyRes.headers)) {
+        if (!skipHeaders.has(key.toLowerCase())) {
+          res.setHeader(key, value);
+        }
+      }
+      res.status(proxyRes.statusCode);
 
-    try {
-      if (isSSE) {
-        // SSE streaming — intercept each line and reverse tool renames
-        let buffer = '';
-        proxyRes.setEncoding('utf8');
-        for await (const chunk of proxyRes) {
-          buffer += chunk;
-          const lines = buffer.split('\n');
-          buffer = lines.pop(); // keep incomplete last line
-          for (const line of lines) {
-            res.write(desanitizeSseLine(line) + '\n');
+      // Any upstream response that reaches here is non-401 (401s and
+      // retryable 429s are intercepted in makeRequest) — even a 4xx proves
+      // auth works, so reset the circuit breaker / release the probe.
+      recordCircuitSuccess();
+
+      const contentType = proxyRes.headers['content-type'] || '';
+      const isSSE = contentType.includes('text/event-stream');
+
+      try {
+        if (isSSE) {
+          // SSE streaming — intercept each line and reverse tool renames
+          let buffer = '';
+          proxyRes.setEncoding('utf8');
+          for await (const chunk of proxyRes) {
+            buffer += chunk;
+            const lines = buffer.split('\n');
+            buffer = lines.pop(); // keep incomplete last line
+            for (const line of lines) {
+              res.write(desanitizeSseLine(line) + '\n');
+            }
+          }
+          if (buffer) res.write(desanitizeSseLine(buffer) + '\n');
+          res.end();
+        } else {
+          // Non-streaming JSON — buffer full response, reverse tool renames, forward
+          const chunks = [];
+          for await (const chunk of proxyRes) chunks.push(chunk);
+          const raw = Buffer.concat(chunks).toString('utf8');
+          if (sc >= 400) log(`← ERROR body: ${raw.slice(0, 300)}`);
+          try {
+            const parsed = JSON.parse(raw);
+            const fixed = desanitizeResponseJson(parsed);
+            const out = JSON.stringify(fixed);
+            res.setHeader('content-length', Buffer.byteLength(out));
+            res.end(out);
+          } catch {
+            // Not JSON (unlikely) — pass through as-is
+            res.end(raw);
           }
         }
-        if (buffer) res.write(desanitizeSseLine(buffer) + '\n');
-        res.end();
-      } else {
-        // Non-streaming JSON — buffer full response, reverse tool renames, forward
-        const chunks = [];
-        for await (const chunk of proxyRes) chunks.push(chunk);
-        const raw = Buffer.concat(chunks).toString('utf8');
-        if (sc >= 400) log(`← ERROR body: ${raw.slice(0, 300)}`);
-        try {
-          const parsed = JSON.parse(raw);
-          const fixed = desanitizeResponseJson(parsed);
-          const out = JSON.stringify(fixed);
-          res.setHeader('content-length', Buffer.byteLength(out));
-          res.end(out);
-        } catch {
-          // Not JSON (unlikely) — pass through as-is
-          res.end(raw);
-        }
+      } catch (err) {
+        // Upstream stream failed mid-response — abort the client connection so
+        // it does not hang waiting for a body that will never complete.
+        log('Response stream error:', err.message);
+        if (!res.destroyed) res.destroy(err);
       }
-    } catch (err) {
-      // Upstream stream failed mid-response — abort the client connection so
-      // it does not hang waiting for a body that will never complete.
-      log('Response stream error:', err.message);
-      if (!res.destroyed) res.destroy(err);
+      return; // Exit the retry loop
     }
-    return; // Exit the retry loop
+  } finally {
+    // Guarantee the admitted probe is released even on paths that produced
+    // no auth evidence (token acquisition or transport errors). The circuit
+    // state is left untouched so the next request is admitted to re-probe.
+    if (holdingProbe && !circuitOutcomeRecorded) circuit.probeInFlight = false;
   }
 }
 
@@ -1183,24 +1260,37 @@ async function forwardRequest(req, res, body, dependencies = {}) {
 // Routes
 // ---------------------------------------------------------------------------
 
+// Timing-safe comparison against the proxy secret.
+function secretMatches(candidate) {
+  if (typeof candidate !== 'string' || candidate.length === 0) return false;
+  try {
+    const a = Buffer.from(candidate);
+    const b = Buffer.from(PROXY_SECRET);
+    return a.length === b.length && timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+// Accepts the proxy secret via EITHER header form so existing client configs
+// (Anthropic SDKs send x-api-key; others send Authorization: Bearer) keep
+// working — only the VALUE must equal PROXY_SECRET.
 function requireSecret(req, res, next) {
   const auth = req.headers['authorization'] || '';
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-  // Use timingSafeEqual to prevent timing attacks
-  let ok = false;
-  try {
-    const a = Buffer.from(token);
-    const b = Buffer.from(PROXY_SECRET);
-    ok = a.length === b.length && timingSafeEqual(a, b);
-  } catch {}
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  const apiKey = req.headers['x-api-key'];
+  const ok = secretMatches(bearer) || secretMatches(apiKey);
   if (!ok) {
-    return res.status(401).json({ type: 'error', error: { type: 'unauthorized', message: 'Invalid or missing Authorization: Bearer <PROXY_SECRET>' } });
+    return res.status(401).json({ type: 'error', error: { type: 'unauthorized', message: 'Invalid or missing proxy secret — send "Authorization: Bearer <PROXY_SECRET>" or "x-api-key: <PROXY_SECRET>"' } });
   }
   next();
 }
 
-// Parse JSON body for POST requests
-app.use(express.json({ limit: '50mb' }));
+// JSON body parsing is route-local and runs AFTER requireSecret so an
+// unauthenticated client can never make the proxy buffer/parse up to 50MB.
+// Only /v1/messages needs a parsed body: /v1/models is GET-only (body unused),
+// /health and /force-refresh never read req.body.
+const jsonBody = express.json({ limit: '50mb' });
 
 // POST /v1/messages — main proxy endpoint (sanitize + forward)
 async function handleMessages(req, res, requestDebugDumps) {
@@ -1275,7 +1365,7 @@ async function handleMessages(req, res, requestDebugDumps) {
   await forwardRequest(req, res, sanitizedBody);
 }
 
-app.post('/v1/messages', requireSecret, async (req, res) => {
+app.post('/v1/messages', requireSecret, jsonBody, async (req, res) => {
   const requestDebugDumps = DEBUG ? debugDumpRegistry.beginRequest() : null;
   try {
     await handleMessages(req, res, requestDebugDumps);
@@ -1357,15 +1447,17 @@ if (!process.env.PROXY_TEST) {
   app.listen(PORT, '127.0.0.1', () => {
     log(`claude-max-proxy v${require('./package.json').version} (oauth-proxy mode)`);
     log(`Listening on http://127.0.0.1:${PORT}`);
-    if (GENERATED_PROXY_SECRET) {
-      // Secret was auto-generated this boot — printing it is the only way the
-      // user can learn it (documented UX).
-      log('Proxy secret: ' + PROXY_SECRET);
-      log('  Set header: Authorization: Bearer ' + PROXY_SECRET);
+    if (PROXY_SECRET_SOURCE === 'generated') {
+      // Secret was auto-generated this boot — printing it (once) is the only
+      // way the user can learn it (documented UX). All other mentions below
+      // use a placeholder.
+      log('Proxy secret (generated this boot, not persisted): ' + PROXY_SECRET);
+    } else if (PROXY_SECRET_SOURCE === 'file') {
+      log(`Proxy secret: loaded from ${PROXY_SECRET_FILE}`);
     } else {
-      log('Proxy secret: (set via env)');
-      log('  Set header: Authorization: Bearer <PROXY_SECRET>');
+      log('Proxy secret: (set via PROXY_SECRET env)');
     }
+    log('  Send it as "Authorization: Bearer <PROXY_SECRET>" or "x-api-key: <PROXY_SECRET>"');
     log(`Proxying → ${ANTHROPIC_BASE} (with CLI OAuth credentials)`);
     log(`OpenClaw sanitization: ${SANITIZE_OPENCLAW ? 'enabled' : 'disabled'}`);
     log(`Tool name mode: ${NORMALIZE_TOOL_NAMES ? 'normalize' : 'preserve'}`);
@@ -1378,7 +1470,7 @@ if (!process.env.PROXY_TEST) {
     log('');
     log('Configure your app to use:');
     log(`  Base URL: http://127.0.0.1:${PORT}`);
-    log('  Authorization: Bearer ' + (GENERATED_PROXY_SECRET ? PROXY_SECRET : '<PROXY_SECRET> (set via env)'));
+    log('  API key / bearer token: <PROXY_SECRET> (see "Proxy secret" line above)');
     log('');
     if (DEBUG) log('Debug mode enabled');
   });
@@ -1398,6 +1490,7 @@ process.on('SIGINT', () => {
 // Exports for testing
 if (require.main !== module) {
   module.exports = {
+    app,
     TOOL_RENAMES,
     TOOL_RENAMES_REVERSE,
     TOOL_NAME_MODE,

@@ -52,6 +52,33 @@ else
   echo ""
 fi
 
+# ── Proxy secret ───────────────────────────────────────────────────────────────
+# Generate once, persist with owner-only permissions, and inject into the
+# service so the proxy, the watchdog, and client configs share one stable
+# secret. Clients send it as 'Authorization: Bearer <secret>' or
+# 'x-api-key: <secret>'.
+echo ""
+SECRET_FILE="$USER_HOME/.claude-max-proxy-secret"
+if [ -s "$SECRET_FILE" ]; then
+  echo "Proxy secret: using existing $SECRET_FILE"
+else
+  OLD_UMASK=$(umask)
+  umask 077
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 24 > "$SECRET_FILE"
+  else
+    "$NODE_BIN" -e "console.log(require('crypto').randomBytes(24).toString('hex'))" > "$SECRET_FILE"
+  fi
+  umask "$OLD_UMASK"
+  echo "Proxy secret: generated and saved to $SECRET_FILE"
+fi
+chmod 600 "$SECRET_FILE"
+PROXY_SECRET_VALUE=$(tr -d '[:space:]' < "$SECRET_FILE")
+if [ -z "$PROXY_SECRET_VALUE" ]; then
+  echo "ERROR: could not read proxy secret from $SECRET_FILE"
+  exit 1
+fi
+
 # ── macOS: LaunchAgent ─────────────────────────────────────────────────────────
 if [ "$(uname)" = "Darwin" ]; then
   PLIST="$USER_HOME/Library/LaunchAgents/com.claude-max-proxy.plist"
@@ -76,7 +103,8 @@ if [ "$(uname)" = "Darwin" ]; then
     <string>$REPO_DIR</string>
     <key>EnvironmentVariables</key>
     <dict>
-        <!-- Optional: set PROXY_SECRET for a stable bearer secret; otherwise the generated value is printed at startup. -->
+        <key>PROXY_SECRET</key>
+        <string>$PROXY_SECRET_VALUE</string>
         <key>PORT</key>
         <string>4523</string>
         <key>AUTH_HEADER_FORMAT</key>
@@ -103,6 +131,9 @@ if [ "$(uname)" = "Darwin" ]; then
 </dict>
 </plist>
 EOF
+
+  # The plist embeds PROXY_SECRET — keep it owner-only
+  chmod 600 "$PLIST"
 
   # Stop any existing instance
   launchctl bootout gui/$UID/com.claude-max-proxy 2>/dev/null || true
@@ -144,7 +175,7 @@ WorkingDirectory=$REPO_DIR
 ExecStart=$NODE_BIN $REPO_DIR/index.js
 Restart=on-failure
 RestartSec=5
-# Optional: set PROXY_SECRET for a stable bearer secret; otherwise the generated value is printed at startup.
+Environment=PROXY_SECRET=$PROXY_SECRET_VALUE
 Environment=PORT=4523
 Environment=AUTH_HEADER_FORMAT=bearer
 Environment=SANITIZE_OPENCLAW=0
@@ -155,6 +186,9 @@ Environment=HOME=$USER_HOME
 [Install]
 WantedBy=default.target
 EOF
+
+  # The unit file embeds PROXY_SECRET — keep it owner-only
+  chmod 600 "$SERVICE_FILE"
 
   systemctl --user daemon-reload
   systemctl --user enable --now claude-max-proxy
@@ -334,7 +368,14 @@ echo "Setup complete."
 echo ""
 echo "Next steps:"
 echo "  1. Point your app's Anthropic base URL to http://127.0.0.1:4523"
-echo "  2. Use any string as the API key (e.g. 'claude-max-proxy')"
+echo "  2. Set your app's API key to the proxy secret below."
+echo "     It is accepted as either header:"
+echo "       Authorization: Bearer <secret>"
+echo "       x-api-key: <secret>"
+echo ""
+echo "     Your proxy secret (persisted at $SECRET_FILE):"
+echo "       $PROXY_SECRET_VALUE"
+echo ""
 echo "  3. See README.md for app-specific config"
 echo "  4. Optional: rerun with INSTALL_TELEGRAM_TRIGGER=1 for direct Telegram repair commands"
 echo ""

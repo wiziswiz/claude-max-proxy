@@ -21,6 +21,16 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"
 }
 
+# Proxy secret — required by /v1/messages and /force-refresh on the proxy.
+# Resolution order matches the proxy itself: env, then the file persisted by
+# setup.sh. Never log the secret value.
+PROXY_SECRET="${PROXY_SECRET:-}"
+PROXY_SECRET_FILE="$HOME/.claude-max-proxy-secret"
+if [ -z "$PROXY_SECRET" ] && [ -f "$PROXY_SECRET_FILE" ]; then
+  PROXY_SECRET=$(tr -d '[:space:]' < "$PROXY_SECRET_FILE")
+fi
+export WATCHDOG_PROXY_SECRET="$PROXY_SECRET"
+
 # Run a node script from a string, passing $1 as process.argv[1].
 # Uses a temp file to avoid stdin dependency (heredoc breaks when stdin is unavailable,
 # e.g. when called via execFile from the Telegram trigger).
@@ -53,7 +63,7 @@ if [ -f "$PLIST" ]; then
 const fs = require("fs");
 const path = process.argv[1];
 let content = fs.readFileSync(path, "utf8");
-const vars = { ANTHROPIC_API_KEY: "claude-max-proxy", ANTHROPIC_BASE_URL: "http://127.0.0.1:4523" };
+const vars = { ANTHROPIC_API_KEY: process.env.WATCHDOG_PROXY_SECRET || "claude-max-proxy", ANTHROPIC_BASE_URL: "http://127.0.0.1:4523" };
 for (const [key, value] of Object.entries(vars)) {
   if (!content.includes("<key>" + key + "</key>")) {
     content = content.replace("</dict>\n</dict>", "    <key>" + key + "</key>\n    <string>" + value + "</string>\n    </dict>\n</dict>");
@@ -238,11 +248,15 @@ HEALTH=$(curl -s --max-time 5 "$PROXY_URL/health" 2>/dev/null)
 if echo "$HEALTH" | grep -q '"token":"valid"'; then
   log "Proxy health: token valid"
 
+  if [ -z "$PROXY_SECRET" ]; then
+    log "WARNING: no proxy secret found (PROXY_SECRET env or $PROXY_SECRET_FILE) — probe will get HTTP 401 from the proxy itself"
+  fi
+
   TEST_BODY='{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"1"}]}'
   TEST_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
     -X POST "$PROXY_URL/v1/messages" \
     -H "content-type: application/json" \
-    -H "x-api-key: claude-max-proxy" \
+    -H "x-api-key: $PROXY_SECRET" \
     -H "anthropic-version: 2023-06-01" \
     -d "$TEST_BODY" 2>/dev/null)
 
@@ -250,7 +264,8 @@ if echo "$HEALTH" | grep -q '"token":"valid"'; then
     log "Proxy token: Anthropic accepted (HTTP 200)"
   elif [ "$TEST_STATUS" = "401" ]; then
     log "WARNING: Anthropic rejected token (HTTP 401) — forcing refresh"
-    REFRESH_RESULT=$(curl -s --max-time 15 -X POST "$PROXY_URL/force-refresh" 2>/dev/null)
+    REFRESH_RESULT=$(curl -s --max-time 15 -X POST "$PROXY_URL/force-refresh" \
+      -H "Authorization: Bearer $PROXY_SECRET" 2>/dev/null)
     if echo "$REFRESH_RESULT" | grep -q '"status":"ok"'; then
       log "Token force-refreshed: $REFRESH_RESULT"
       if [ -f "$AUTH_PROFILES" ]; then

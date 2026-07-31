@@ -12,8 +12,13 @@
 const assert = require('assert');
 const http = require('http');
 
+// Short connect timeout so the live connect-timeout / slow-first-byte tests
+// run quickly. Must be set before index.js is required.
+process.env.CONNECT_TIMEOUT_MS = '300';
+
 const {
   MAX_RETRY_AFTER_MS,
+  CONNECT_TIMEOUT_MS,
   forwardRequest,
   makeRequest,
   circuit,
@@ -118,6 +123,76 @@ function dependencies(overrides = {}) {
     assert.strictEqual(res.statusCode, 502);
     assert.strictEqual(res.body.type, 'error');
     assert.strictEqual(res.body.error.type, 'api_error');
+  });
+
+  await test('ETIMEDOUT-shaped error (no "timeout" in message) maps to 504 gateway_timeout', async () => {
+    resetCircuit();
+    const res = makeResponse();
+    const err = Object.assign(new Error('connect ETIMEDOUT 104.18.32.47:443'), { code: 'ETIMEDOUT' });
+    await forwardRequest(makeReq(), res, {}, dependencies({
+      makeRequest: async () => { throw err; },
+    }));
+    assert.strictEqual(res.statusCode, 504);
+    assert.strictEqual(res.body.error.type, 'gateway_timeout');
+  });
+
+  console.log('\nConnect timer behavior');
+
+  await test(`unconnectable target trips the connect timer (~${CONNECT_TIMEOUT_MS}ms)`, async () => {
+    assert.strictEqual(CONNECT_TIMEOUT_MS, 300, 'CONNECT_TIMEOUT_MS override applied');
+    // 10.255.255.1 is a blackhole address: SYNs are dropped, the TCP connect
+    // hangs, and only our connect timer can end the request.
+    const start = Date.now();
+    await assert.rejects(
+      makeRequest(
+        new URL('http://10.255.255.1:9/v1/messages'),
+        'POST',
+        { 'content-type': 'application/json' },
+        '{}'
+      ),
+      (err) => {
+        assert.match(err.message, /Connect timeout after 300ms/);
+        return true;
+      }
+    );
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed >= CONNECT_TIMEOUT_MS - 50, `fired after the timeout window (${elapsed}ms)`);
+    assert.ok(elapsed < CONNECT_TIMEOUT_MS * 10, `did not hang (${elapsed}ms)`);
+  });
+
+  await test('connected upstream with slow first byte is NOT killed by the connect timer', async () => {
+    // Upstream accepts the connection immediately but holds headers back for
+    // 3x the connect timeout. Before the fix, the connect timer (which was
+    // only cleared on first byte) destroyed this request at 300ms.
+    const headerDelayMs = CONNECT_TIMEOUT_MS * 3;
+    const server = http.createServer((req, resp) => {
+      setTimeout(() => {
+        resp.writeHead(200, { 'content-type': 'application/json' });
+        resp.end('{"ok":true}');
+      }, headerDelayMs);
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const port = server.address().port;
+      const start = Date.now();
+      const result = await makeRequest(
+        new URL(`http://127.0.0.1:${port}/v1/messages`),
+        'POST',
+        { 'content-type': 'application/json' },
+        '{}'
+      );
+      const elapsed = Date.now() - start;
+      assert.strictEqual(result.retry, false);
+      assert.strictEqual(result.proxyRes.statusCode, 200);
+      assert.ok(
+        elapsed >= headerDelayMs - 50,
+        `headers arrived after the delay, past the connect window (${elapsed}ms)`
+      );
+      // Drain the body so the server can close cleanly
+      for await (const chunk of result.proxyRes) void chunk;
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+    }
   });
 
   console.log('\nRetry-After capping');

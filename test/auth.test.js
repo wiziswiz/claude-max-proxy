@@ -41,9 +41,10 @@ function test(label, fn) {
   }
 }
 
-function authenticate(authorization) {
+function authenticate(authorization, apiKey) {
   const req = { headers: {} };
   if (authorization !== undefined) req.headers.authorization = authorization;
+  if (apiKey !== undefined) req.headers['x-api-key'] = apiKey;
   const res = makeResponse();
   let nextCalled = false;
 
@@ -79,6 +80,39 @@ test('rejects differing token lengths without throwing', () => {
   let result;
   assert.doesNotThrow(() => {
     result = authenticate('Bearer x');
+  });
+  assert.strictEqual(result.nextCalled, false);
+  assert.strictEqual(result.res.statusCode, 401);
+});
+
+test('passes with a matching x-api-key header', () => {
+  const { res, nextCalled } = authenticate(undefined, TEST_SECRET);
+  assert.strictEqual(nextCalled, true);
+  assert.strictEqual(res.statusCode, null);
+});
+
+test('rejects an incorrect x-api-key with 401', () => {
+  const { res, nextCalled } = authenticate(undefined, 'wrong-proxy-secret');
+  assert.strictEqual(nextCalled, false);
+  assert.strictEqual(res.statusCode, 401);
+});
+
+test('rejects an empty x-api-key with 401', () => {
+  const { res, nextCalled } = authenticate(undefined, '');
+  assert.strictEqual(nextCalled, false);
+  assert.strictEqual(res.statusCode, 401);
+});
+
+test('accepts a correct x-api-key even when Authorization is malformed', () => {
+  const { res, nextCalled } = authenticate('Bearer wrong', TEST_SECRET);
+  assert.strictEqual(nextCalled, true);
+  assert.strictEqual(res.statusCode, null);
+});
+
+test('rejects a non-string (repeated) x-api-key header without throwing', () => {
+  let result;
+  assert.doesNotThrow(() => {
+    result = authenticate(undefined, [TEST_SECRET, TEST_SECRET]);
   });
   assert.strictEqual(result.nextCalled, false);
   assert.strictEqual(result.res.statusCode, 401);

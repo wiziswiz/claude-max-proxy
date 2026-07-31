@@ -39,6 +39,7 @@ function makeResponse() {
     headersSent: false,
     statusCode: null,
     body: null,
+    destroyed: false,
     set(name, value) {
       this.headers[name] = value;
       return this;
@@ -53,6 +54,20 @@ function makeResponse() {
     json(body) {
       this.body = body;
       this.headersSent = true;
+      return this;
+    },
+    write(chunk) {
+      this.body = (this.body || '') + chunk;
+      this.headersSent = true;
+      return true;
+    },
+    end(chunk) {
+      if (chunk !== undefined) this.body = chunk;
+      this.headersSent = true;
+      return this;
+    },
+    destroy() {
+      this.destroyed = true;
       return this;
     },
   };
@@ -201,6 +216,99 @@ function retryDependencies(result, overrides = {}) {
     ));
     assert.strictEqual(res.statusCode, 429);
     assert.strictEqual(res.body.error.type, 'upstream_error');
+  });
+
+  console.log('\nHalf-open probe release (no wedged circuit)');
+
+  // Put the circuit in the open state with an elapsed cooldown, so the next
+  // forwardRequest is admitted as the single half-open probe.
+  function armHalfOpenProbe() {
+    resetCircuit();
+    circuit.state = 'open';
+    circuit.failures = circuit.THRESHOLD;
+    circuit.openedAt = Date.now() - circuit.COOLDOWN_MS;
+  }
+
+  function fakeUpstreamResponse(statusCode, body) {
+    return {
+      statusCode,
+      statusMessage: 'stub',
+      headers: { 'content-type': 'application/json' },
+      setEncoding() {},
+      async *[Symbol.asyncIterator]() { yield Buffer.from(body); },
+    };
+  }
+
+  await test('probe released when getAccessToken throws (early 401 return)', async () => {
+    armHalfOpenProbe();
+    const res = makeResponse();
+    await withTimeout(forwardRequest(makeRequest(), res, {}, retryDependencies(null, {
+      getAccessToken: async () => { throw new Error('No credentials available'); },
+      makeRequest: async () => { throw new Error('makeRequest must not be reached'); },
+    })));
+    assert.strictEqual(res.statusCode, 401);
+    assert.strictEqual(res.body.error.type, 'proxy_auth_error');
+    assert.strictEqual(circuit.probeInFlight, false, 'probe slot must be released');
+    // Next request must be admitted as a fresh probe, not rejected 503
+    assert.deepStrictEqual(circuitAllow(), { ok: true });
+  });
+
+  await test('probe released on transport error (no auth evidence, circuit not closed)', async () => {
+    armHalfOpenProbe();
+    const res = makeResponse();
+    await withTimeout(forwardRequest(makeRequest(), res, {}, retryDependencies(null, {
+      makeRequest: async () => { throw new Error('connect ECONNREFUSED 127.0.0.1:443'); },
+    })));
+    assert.strictEqual(res.statusCode, 502);
+    assert.strictEqual(circuit.probeInFlight, false, 'probe slot must be released');
+    assert.notStrictEqual(circuit.state, 'closed', 'no-evidence error must not close the circuit');
+    assert.deepStrictEqual(circuitAllow(), { ok: true });
+  });
+
+  await test('probe resolved on exhausted 429s (upstream responded → auth proven, circuit closes)', async () => {
+    armHalfOpenProbe();
+    const res = makeResponse();
+    await withTimeout(forwardRequest(
+      makeRequest(),
+      res,
+      {},
+      retryDependencies({ retry: true, retryAfterMs: 1, body: '{"error":"rate_limited"}' })
+    ));
+    assert.strictEqual(res.statusCode, 429);
+    assert.strictEqual(circuit.probeInFlight, false, 'probe slot must be released');
+    assert.strictEqual(circuit.state, 'closed');
+    assert.deepStrictEqual(circuitAllow(), { ok: true });
+  });
+
+  await test('probe resolved on a non-401 4xx upstream response (auth proven, circuit closes)', async () => {
+    armHalfOpenProbe();
+    const res = makeResponse();
+    await withTimeout(forwardRequest(makeRequest(), res, {}, retryDependencies(null, {
+      makeRequest: async () => ({ retry: false, proxyRes: fakeUpstreamResponse(400, '{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}') }),
+    })));
+    assert.strictEqual(res.statusCode, 400);
+    assert.strictEqual(circuit.probeInFlight, false, 'probe slot must be released');
+    assert.strictEqual(circuit.state, 'closed');
+    assert.deepStrictEqual(circuitAllow(), { ok: true });
+  });
+
+  await test('probe resolved on a terminal 401 (circuit reopens, later probe admitted after cooldown)', async () => {
+    armHalfOpenProbe();
+    const res = makeResponse();
+    await withTimeout(forwardRequest(
+      makeRequest(),
+      res,
+      {},
+      retryDependencies({ retry401: true, body: '{"error":"x"}' })
+    ));
+    assert.strictEqual(res.statusCode, 401);
+    assert.strictEqual(circuit.probeInFlight, false, 'probe slot must be released');
+    assert.strictEqual(circuit.state, 'open');
+    // Immediately blocked (cooldown restarted)…
+    assert.strictEqual(circuitAllow().ok, false);
+    // …but once the cooldown elapses, a new probe is admitted — not wedged.
+    circuit.openedAt = Date.now() - circuit.COOLDOWN_MS;
+    assert.deepStrictEqual(circuitAllow(), { ok: true });
   });
 
   resetCircuit();

@@ -60,7 +60,18 @@ curl http://localhost:4523/health
 
 ## App configuration
 
-Point your app's Anthropic base URL at `http://127.0.0.1:4523`. Use any non-empty string as the API key — auth is handled by the proxy using your local credentials.
+Point your app's Anthropic base URL at `http://127.0.0.1:4523` and set your app's API key to your **proxy secret** (`PROXY_SECRET`). The secret is accepted as either header — you don't need to change how your client sends its key, only the value:
+
+- `Authorization: Bearer <PROXY_SECRET>`
+- `x-api-key: <PROXY_SECRET>` (what most Anthropic SDK clients send)
+
+Where the secret comes from, in order:
+
+1. `PROXY_SECRET` env var, if you set one
+2. `~/.claude-max-proxy-secret` — created by `./setup.sh` (owner-only, `0600`) and shared by the service, the watchdog, and your client configs
+3. Otherwise a random secret is generated at startup and printed once in the proxy log
+
+> **Migration note:** earlier versions accepted *any* API key value (e.g. `"claude-max-proxy"`). That is no longer true — the value must now equal your `PROXY_SECRET`. Existing client configs keep working as-is once you replace the placeholder value with the real secret (run `./setup.sh` to generate and persist one, or read it from `~/.claude-max-proxy-secret`).
 
 | App | Setting | Value |
 |-----|---------|-------|
@@ -82,7 +93,7 @@ Add this to `~/.openclaw/openclaw.json` under `models.providers`:
   "providers": {
     "anthropic": {
       "baseUrl": "http://127.0.0.1:4523",
-      "apiKey": "claude-max-proxy",
+      "apiKey": "<your PROXY_SECRET — e.g. contents of ~/.claude-max-proxy-secret>",
       "models": [
         { "id": "claude-opus-4-7",   "name": "Claude Opus 4.7",   "api": "anthropic-messages" },
         { "id": "claude-opus-4-6",   "name": "Claude Opus 4.6",   "api": "anthropic-messages" },
@@ -193,7 +204,7 @@ If credentials are missing: `Run "claude auth login" to re-authenticate`
 | `SANITIZE_OPENCLAW` | `0` | Set to `1` to enable legacy OpenClaw text/path rewriting |
 | `TOOL_NAME_MODE` | `normalize` | `normalize` maps selected OpenClaw tool names upstream and restores them inbound. `preserve` keeps raw tool names for diagnostics |
 | `TOOL_SCHEMA_MODE` | `compact` | `compact` strips verbose tool/schema descriptions while preserving tool names and input shapes. Use `full` for diagnostics |
-| `PROXY_SECRET` | *(generated)* | Bearer secret required on `/v1/messages`, `/v1/models`, and `/force-refresh`. If unset, a random secret is generated and printed at startup |
+| `PROXY_SECRET` | *(file or generated)* | Secret required on `/v1/messages`, `/v1/models`, and `/force-refresh` — accepted as `Authorization: Bearer <secret>` or `x-api-key: <secret>`. If unset, the proxy reads `~/.claude-max-proxy-secret` (persisted by `setup.sh`); if that is also missing, a random secret is generated and printed once at startup |
 | `CONNECT_TIMEOUT_MS` | `10000` | Abort upstream requests if the connection is not established within this window |
 | `RESPONSE_TIMEOUT_MS` | `600000` | Abort upstream requests if the socket is inactive for this long (long default to allow SSE streams) |
 | `MAX_RETRY_AFTER_MS` | `30000` | Cap on upstream `Retry-After` values and 429 retry backoff delays |
@@ -202,10 +213,10 @@ If credentials are missing: `Run "claude auth login" to re-authenticate`
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/v1/messages` | Anthropic Messages API (streaming and non-streaming). Requires `Authorization: Bearer <PROXY_SECRET>` |
-| `GET` | `/v1/models` | Forwards to Anthropic's model list. Requires `Authorization: Bearer <PROXY_SECRET>` |
+| `POST` | `/v1/messages` | Anthropic Messages API (streaming and non-streaming). Requires the proxy secret (`Authorization: Bearer` or `x-api-key`) |
+| `GET` | `/v1/models` | Forwards to Anthropic's model list. Requires the proxy secret (`Authorization: Bearer` or `x-api-key`) |
 | `GET` | `/health` | Health check with token status and subscription validation. No auth required |
-| `POST` | `/force-refresh` | Force immediate OAuth token refresh. Requires `Authorization: Bearer <PROXY_SECRET>` |
+| `POST` | `/force-refresh` | Force immediate OAuth token refresh. Requires the proxy secret (`Authorization: Bearer` or `x-api-key`) |
 
 ## Running as a service
 
@@ -240,6 +251,8 @@ Create `~/Library/LaunchAgents/com.claude-max-proxy.plist`:
     <string>/Users/YOUR_USER/claude-max-proxy</string>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>PROXY_SECRET</key>
+        <string>YOUR_PROXY_SECRET</string>
         <key>PORT</key>
         <string>4523</string>
         <key>AUTH_HEADER_FORMAT</key>
@@ -286,6 +299,7 @@ WorkingDirectory=/home/YOUR_USER/claude-max-proxy
 ExecStart=/usr/bin/node /home/YOUR_USER/claude-max-proxy/index.js
 Restart=on-failure
 RestartSec=5
+Environment=PROXY_SECRET=YOUR_PROXY_SECRET
 Environment=PORT=4523
 Environment=AUTH_HEADER_FORMAT=bearer
 Environment=SANITIZE_OPENCLAW=0
@@ -310,6 +324,8 @@ The included `openclaw-auth-watchdog` script runs periodically and automatically
 3. Verifies `auth-profiles.json` order puts `anthropic:claude-cli` first
 4. Extends the profile's `expires` field if it has lapsed
 5. Makes a live test request to confirm the token is accepted, force-refreshes if not
+
+The watchdog authenticates to the proxy with the shared secret: it uses the `PROXY_SECRET` env var if set, otherwise `~/.claude-max-proxy-secret` (the file `setup.sh` creates).
 
 Install manually:
 
@@ -445,7 +461,9 @@ OpenClaw caches auth failures and won't retry a profile until the cooldown expir
 - Binds to `127.0.0.1` only — not accessible from the network
 - Credentials file accessed with owner-only permissions
 - No tokens are logged, even in debug mode
-- A random bearer secret is generated at startup and logged once. Set it as `PROXY_SECRET` env var for a stable value. Every request to `/v1/messages`, `/v1/models`, and `/force-refresh` must include `Authorization: Bearer <secret>`. The `/health` endpoint remains open for monitoring.
+- Every request to `/v1/messages`, `/v1/models`, and `/force-refresh` must include the proxy secret, timing-safe compared, as either `Authorization: Bearer <secret>` or `x-api-key: <secret>`. The `/health` endpoint remains open for monitoring.
+- The secret comes from the `PROXY_SECRET` env var, or from `~/.claude-max-proxy-secret` (created by `setup.sh` with `0600` permissions and injected into the service definition). If neither exists, a random secret is generated at startup and printed exactly once in the log — it is not persisted, so prefer `setup.sh` for a stable value.
+- Request body parsing (up to 50MB) only happens **after** the secret check, so unauthenticated clients cannot make the proxy buffer large payloads.
 - With `DEBUG=1`, conversation content (not auth tokens) is written to owner-only (`0600`) files with random names in the OS temporary directory. Every request produces original and sanitized dumps; sessions with 15 or more messages also produce a large-session dump. No dump files are written in normal operation.
 - Dumps from completed requests are removed when a later request starts, and all tracked dumps are removed during graceful process exit. `SIGKILL`, OOM kills, or uncaught exceptions can bypass cleanup, so remove any files left after abnormal termination.
 - Do not expose this proxy on a public interface
