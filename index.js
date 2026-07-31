@@ -23,7 +23,7 @@
 
 const express = require('express');
 const { readFileSync, watchFile, unwatchFile } = require('fs');
-const { homedir } = require('os');
+const { homedir, tmpdir } = require('os');
 const { join } = require('path');
 const http = require('http');
 const https = require('https');
@@ -64,6 +64,70 @@ function log(...args) {
 function debug(...args) {
   if (DEBUG) console.log(`[${new Date().toISOString()}] [DEBUG]`, ...args);
 }
+
+const DEBUG_DUMP_MODE = 0o600;
+
+function shouldWriteLargeSessionDump(debugEnabled, messageCount) {
+  return debugEnabled && messageCount >= 15;
+}
+
+function createDebugDumpPath(label) {
+  const suffix = `${Date.now()}-${randomBytes(4).toString('hex')}`;
+  return join(tmpdir(), `claude-proxy-${label}-${suffix}.json`);
+}
+
+function writeDump(dumpPath, content, mode = DEBUG_DUMP_MODE) {
+  require('fs').writeFileSync(dumpPath, JSON.stringify(content, null, 2), { mode });
+}
+
+function createDebugDumpRegistry() {
+  const activePaths = new Set();
+  const completedPaths = new Set();
+
+  function remove(paths) {
+    const fs = require('fs');
+    for (const dumpPath of paths) {
+      try {
+        fs.unlinkSync(dumpPath);
+      } catch (err) {
+        if (err.code !== 'ENOENT') debug(`  Failed to remove debug dump ${dumpPath}: ${err.message}`);
+      }
+    }
+    paths.clear();
+  }
+
+  return {
+    beginRequest() {
+      // Preserve dumps for in-flight requests; only earlier completed requests
+      // are safe to remove when a later request starts.
+      remove(completedPaths);
+      const requestPaths = new Set();
+      let completed = false;
+
+      return {
+        add(dumpPath) {
+          if (completed) throw new Error('Cannot add a dump to a completed request');
+          requestPaths.add(dumpPath);
+          activePaths.add(dumpPath);
+        },
+        complete() {
+          if (completed) return;
+          completed = true;
+          for (const dumpPath of requestPaths) {
+            activePaths.delete(dumpPath);
+            completedPaths.add(dumpPath);
+          }
+        },
+      };
+    },
+    cleanupAll() {
+      remove(completedPaths);
+      remove(activePaths);
+    },
+  };
+}
+
+const debugDumpRegistry = createDebugDumpRegistry();
 
 // ---------------------------------------------------------------------------
 // OAuth credential management
@@ -277,13 +341,15 @@ function syncAuthProfiles(creds) {
 }
 
 // Watch credentials file for external changes (e.g., CLI refreshes token independently)
-watchFile(CREDENTIALS_PATH, { interval: 30_000 }, () => {
-  debug('Credentials file changed externally, reloading and syncing');
-  readCredentials();
-  const fresh = readFreshToken();
-  if (fresh) syncAuthProfiles(fresh);
-  scheduleProactiveRefresh(); // reschedule based on new expiry
-});
+if (!process.env.PROXY_TEST) {
+  watchFile(CREDENTIALS_PATH, { interval: 30_000 }, () => {
+    debug('Credentials file changed externally, reloading and syncing');
+    readCredentials();
+    const fresh = readFreshToken();
+    if (fresh) syncAuthProfiles(fresh);
+    scheduleProactiveRefresh(); // reschedule based on new expiry
+  });
+}
 
 // Proactive token refresh — refreshes 10 minutes before expiry so requests
 // never hit an expired token. Without this, the proxy only refreshes on the
@@ -1081,7 +1147,7 @@ function requireSecret(req, res, next) {
 app.use(express.json({ limit: '50mb' }));
 
 // POST /v1/messages — main proxy endpoint (sanitize + forward)
-app.post('/v1/messages', requireSecret, async (req, res) => {
+async function handleMessages(req, res, requestDebugDumps) {
   const sanitizedBody = rewriteSystemForBillingClassifier(sanitizeRequest(req.body));
 
   const model = sanitizedBody.model || '?';
@@ -1104,11 +1170,12 @@ app.post('/v1/messages', requireSecret, async (req, res) => {
   const hasThinking = !!(sanitizedBody.thinking?.type || sanitizedBody.budget_tokens);
   log(`→ POST /v1/messages | model=${model} | stream=${stream} | messages=${msgCount} | tools=${toolCount} | thinking=${hasThinking} | sys=${sysInfo}`);
 
-  // For large sessions, dump the full request body to a temp file for debugging
-  if (msgCount >= 15) {
-    const dumpPath = `/tmp/claude-proxy-dump-${Date.now()}.json`;
-    require('fs').writeFileSync(dumpPath, JSON.stringify(sanitizedBody, null, 2));
-    log(`  Dumped large request body to ${dumpPath}`);
+  // For large sessions, dump the full request body only in debug mode.
+  if (shouldWriteLargeSessionDump(DEBUG, msgCount)) {
+    const dumpPath = createDebugDumpPath('dump');
+    writeDump(dumpPath, sanitizedBody, DEBUG_DUMP_MODE);
+    requestDebugDumps.add(dumpPath);
+    debug(`  Dumped large request body to ${dumpPath}`);
   }
 
   // Verify sanitization — scan only the fields we actually sanitize.
@@ -1139,14 +1206,26 @@ app.post('/v1/messages', requireSecret, async (req, res) => {
   }
 
   if (DEBUG) {
-    const fs = require('fs');
-    fs.writeFileSync('/tmp/claude-proxy-last-request.json', JSON.stringify(req.body, null, 2));
-    fs.writeFileSync('/tmp/claude-proxy-sanitized-request.json', JSON.stringify(sanitizedBody, null, 2));
-    debug('Original request saved to /tmp/claude-proxy-last-request.json');
-    debug('Sanitized request saved to /tmp/claude-proxy-sanitized-request.json');
+    const originalPath = createDebugDumpPath('orig');
+    const sanitizedPath = createDebugDumpPath('sanitized');
+    writeDump(originalPath, req.body, DEBUG_DUMP_MODE);
+    requestDebugDumps.add(originalPath);
+    writeDump(sanitizedPath, sanitizedBody, DEBUG_DUMP_MODE);
+    requestDebugDumps.add(sanitizedPath);
+    debug(`Original request saved to ${originalPath}`);
+    debug(`Sanitized request saved to ${sanitizedPath}`);
   }
 
   await forwardRequest(req, res, sanitizedBody);
+}
+
+app.post('/v1/messages', requireSecret, async (req, res) => {
+  const requestDebugDumps = DEBUG ? debugDumpRegistry.beginRequest() : null;
+  try {
+    await handleMessages(req, res, requestDebugDumps);
+  } finally {
+    requestDebugDumps?.complete();
+  }
 });
 
 // Forward other known /v1 endpoints
@@ -1215,32 +1294,35 @@ app.post('/force-refresh', requireSecret, async (req, res) => {
 // ---------------------------------------------------------------------------
 
 // Load credentials on startup and schedule proactive refresh
-readCredentials();
-scheduleProactiveRefresh();
+if (!process.env.PROXY_TEST) {
+  readCredentials();
+  scheduleProactiveRefresh();
 
-app.listen(PORT, '127.0.0.1', () => {
-  log(`claude-max-proxy v${require('./package.json').version} (oauth-proxy mode)`);
-  log(`Listening on http://127.0.0.1:${PORT}`);
-  if (GENERATED_PROXY_SECRET) log('Proxy secret: ' + PROXY_SECRET);
-  log('  Set header: Authorization: Bearer ' + PROXY_SECRET);
-  log(`Proxying → ${ANTHROPIC_BASE} (with CLI OAuth credentials)`);
-  log(`OpenClaw sanitization: ${SANITIZE_OPENCLAW ? 'enabled' : 'disabled'}`);
-  log(`Tool name mode: ${NORMALIZE_TOOL_NAMES ? 'normalize' : 'preserve'}`);
-  log(`Tool schema mode: ${COMPACT_TOOL_SCHEMAS ? 'compact' : 'full'}`);
-  log(`Token: ${cachedCredentials ? 'loaded' : 'NOT FOUND — run "claude auth login"'}`);
-  if (cachedCredentials) {
-    log(`Subscription: ${cachedCredentials.subscriptionType} (${cachedCredentials.rateLimitTier})`);
-    log(`Token expires: ${new Date(cachedCredentials.expiresAt).toISOString()}`);
-  }
-  log('');
-  log('Configure your app to use:');
-  log(`  Base URL: http://127.0.0.1:${PORT}`);
-  log('  Authorization: Bearer ' + PROXY_SECRET);
-  log('');
-  if (DEBUG) log('Debug mode enabled');
-});
+  app.listen(PORT, '127.0.0.1', () => {
+    log(`claude-max-proxy v${require('./package.json').version} (oauth-proxy mode)`);
+    log(`Listening on http://127.0.0.1:${PORT}`);
+    if (GENERATED_PROXY_SECRET) log('Proxy secret: ' + PROXY_SECRET);
+    log('  Set header: Authorization: Bearer ' + PROXY_SECRET);
+    log(`Proxying → ${ANTHROPIC_BASE} (with CLI OAuth credentials)`);
+    log(`OpenClaw sanitization: ${SANITIZE_OPENCLAW ? 'enabled' : 'disabled'}`);
+    log(`Tool name mode: ${NORMALIZE_TOOL_NAMES ? 'normalize' : 'preserve'}`);
+    log(`Tool schema mode: ${COMPACT_TOOL_SCHEMAS ? 'compact' : 'full'}`);
+    log(`Token: ${cachedCredentials ? 'loaded' : 'NOT FOUND — run "claude auth login"'}`);
+    if (cachedCredentials) {
+      log(`Subscription: ${cachedCredentials.subscriptionType} (${cachedCredentials.rateLimitTier})`);
+      log(`Token expires: ${new Date(cachedCredentials.expiresAt).toISOString()}`);
+    }
+    log('');
+    log('Configure your app to use:');
+    log(`  Base URL: http://127.0.0.1:${PORT}`);
+    log('  Authorization: Bearer ' + PROXY_SECRET);
+    log('');
+    if (DEBUG) log('Debug mode enabled');
+  });
+}
 
 // Cleanup
+process.on('exit', () => debugDumpRegistry.cleanupAll());
 process.on('SIGTERM', () => {
   unwatchFile(CREDENTIALS_PATH);
   process.exit(0);
@@ -1264,5 +1346,10 @@ if (require.main !== module) {
     rewriteSystemForBillingClassifier,
     sanitizeRequest,
     requireSecret,
+    DEBUG_DUMP_MODE,
+    shouldWriteLargeSessionDump,
+    createDebugDumpPath,
+    writeDump,
+    createDebugDumpRegistry,
   };
 }

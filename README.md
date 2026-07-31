@@ -185,7 +185,7 @@ If credentials are missing: `Run "claude auth login" to re-authenticate`
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `4523` | Port the proxy listens on |
-| `DEBUG` | `false` | Set to `1` for verbose logging (saves requests to `/tmp/`) |
+| `DEBUG` | `false` | Set to `1` for verbose logging and owner-only request dumps in the OS temporary directory |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Upstream Anthropic endpoint |
 | `CREDENTIALS_PATH` | `~/.claude/.credentials.json` | Path to Claude CLI credentials file |
 | `ANTHROPIC_TOKEN` | *(unset)* | Use this token directly, bypassing credentials file and Keychain |
@@ -442,6 +442,8 @@ OpenClaw caches auth failures and won't retry a profile until the cooldown expir
 - Credentials file accessed with owner-only permissions
 - No tokens are logged, even in debug mode
 - A random bearer secret is generated at startup and logged once. Set it as `PROXY_SECRET` env var for a stable value. Every request to `/v1/messages`, `/v1/models`, and `/force-refresh` must include `Authorization: Bearer <secret>`. The `/health` endpoint remains open for monitoring.
+- With `DEBUG=1`, conversation content (not auth tokens) is written to owner-only (`0600`) files with random names in the OS temporary directory. Every request produces original and sanitized dumps; sessions with 15 or more messages also produce a large-session dump. No dump files are written in normal operation.
+- Dumps from completed requests are removed when a later request starts, and all tracked dumps are removed during graceful process exit. `SIGKILL`, OOM kills, or uncaught exceptions can bypass cleanup, so remove any files left after abnormal termination.
 - Do not expose this proxy on a public interface
 
 ## License
