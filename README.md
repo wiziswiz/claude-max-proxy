@@ -193,15 +193,19 @@ If credentials are missing: `Run "claude auth login" to re-authenticate`
 | `SANITIZE_OPENCLAW` | `0` | Set to `1` to enable legacy OpenClaw text/path rewriting |
 | `TOOL_NAME_MODE` | `normalize` | `normalize` maps selected OpenClaw tool names upstream and restores them inbound. `preserve` keeps raw tool names for diagnostics |
 | `TOOL_SCHEMA_MODE` | `compact` | `compact` strips verbose tool/schema descriptions while preserving tool names and input shapes. Use `full` for diagnostics |
+| `PROXY_SECRET` | *(generated)* | Bearer secret required on `/v1/messages`, `/v1/models`, and `/force-refresh`. If unset, a random secret is generated and printed at startup |
+| `CONNECT_TIMEOUT_MS` | `10000` | Abort upstream requests if the connection is not established within this window |
+| `RESPONSE_TIMEOUT_MS` | `600000` | Abort upstream requests if the socket is inactive for this long (long default to allow SSE streams) |
+| `MAX_RETRY_AFTER_MS` | `30000` | Cap on upstream `Retry-After` values and 429 retry backoff delays |
 
 ## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/v1/messages` | Anthropic Messages API (streaming and non-streaming) |
-| `GET` | `/v1/models` | Forwards to Anthropic's model list |
-| `GET` | `/health` | Health check with token status and subscription validation |
-| `POST` | `/force-refresh` | Force immediate OAuth token refresh |
+| `POST` | `/v1/messages` | Anthropic Messages API (streaming and non-streaming). Requires `Authorization: Bearer <PROXY_SECRET>` |
+| `GET` | `/v1/models` | Forwards to Anthropic's model list. Requires `Authorization: Bearer <PROXY_SECRET>` |
+| `GET` | `/health` | Health check with token status and subscription validation. No auth required |
+| `POST` | `/force-refresh` | Force immediate OAuth token refresh. Requires `Authorization: Bearer <PROXY_SECRET>` |
 
 ## Running as a service
 

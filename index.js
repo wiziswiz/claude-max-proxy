@@ -34,6 +34,9 @@ const PORT = parseInt(process.env.PORT || '4523', 10);
 const DEBUG = process.env.DEBUG === '1' || process.env.DEBUG === 'true';
 const ANTHROPIC_BASE = process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
 const CREDENTIALS_PATH = process.env.CREDENTIALS_PATH || join(homedir(), '.claude', '.credentials.json');
+const CONNECT_TIMEOUT_MS = parseInt(process.env.CONNECT_TIMEOUT_MS || '10000', 10); // 10s
+const RESPONSE_TIMEOUT_MS = parseInt(process.env.RESPONSE_TIMEOUT_MS || '600000', 10); // 10min for SSE streams
+const MAX_RETRY_AFTER_MS = parseInt(process.env.MAX_RETRY_AFTER_MS || '30000', 10); // 30s cap
 // ANTHROPIC_TOKEN env var: bypass credentials file entirely — set to your sk-ant-oat01-* token directly.
 // Useful when Claude Code stores credentials in macOS Keychain instead of ~/.claude/.credentials.json.
 const ANTHROPIC_TOKEN_OVERRIDE = process.env.ANTHROPIC_TOKEN || null;
@@ -740,6 +743,7 @@ const circuit = {
   state: 'closed',
   failures: 0,
   openedAt: null,
+  probeInFlight: false,
   THRESHOLD: 3,
   COOLDOWN_MS: 60_000,
 };
@@ -750,12 +754,20 @@ function circuitAllow() {
     const elapsed = Date.now() - circuit.openedAt;
     if (elapsed >= circuit.COOLDOWN_MS) {
       circuit.state = 'half-open';
+      circuit.probeInFlight = false;
       log(`[circuit] half-open — probing after ${Math.round(elapsed / 1000)}s cooldown`);
-      return { ok: true };
+    } else {
+      return { ok: false, retryAfter: Math.ceil((circuit.COOLDOWN_MS - elapsed) / 1000) };
     }
-    return { ok: false, retryAfter: Math.ceil((circuit.COOLDOWN_MS - elapsed) / 1000) };
   }
-  return { ok: true }; // half-open: allow the probe through
+  if (circuit.state === 'half-open') {
+    // Admit exactly one probe at a time — concurrent requests during the
+    // half-open window would otherwise all hammer the broken upstream.
+    if (circuit.probeInFlight) return { ok: false, retryAfter: 5 };
+    circuit.probeInFlight = true;
+    return { ok: true };
+  }
+  return { ok: true };
 }
 
 function circuitSuccess() {
@@ -763,10 +775,12 @@ function circuitSuccess() {
   circuit.state = 'closed';
   circuit.failures = 0;
   circuit.openedAt = null;
+  circuit.probeInFlight = false;
 }
 
 function circuitFailure() {
   circuit.failures++;
+  circuit.probeInFlight = false;
   if (circuit.failures >= circuit.THRESHOLD) {
     const wasOpen = circuit.state === 'open';
     circuit.state = 'open';
@@ -824,13 +838,18 @@ function makeRequest(targetUrl, method, headers, payload) {
   return new Promise((resolve, reject) => {
     const transport = targetUrl.protocol === 'https:' ? https : http;
     const proxyReq = transport.request(targetUrl, { method, headers }, (proxyRes) => {
+      clearTimeout(connectTimer);
       if (proxyRes.statusCode === 429 && proxyRes.headers['x-should-retry'] === 'true') {
         // Consume body so connection can be reused, then signal retry
         let body = '';
         proxyRes.on('data', (d) => { body += d; });
         proxyRes.on('end', () => {
           const retryAfter = proxyRes.headers['retry-after'];
-          resolve({ retry: true, retryAfterMs: retryAfter ? parseInt(retryAfter) * 1000 : null, body });
+          const retryAfterSeconds = retryAfter ? parseInt(retryAfter, 10) : NaN;
+          const retryAfterMs = Number.isFinite(retryAfterSeconds)
+            ? Math.min(Math.max(retryAfterSeconds * 1000, 0), MAX_RETRY_AFTER_MS)
+            : null;
+          resolve({ retry: true, retryAfterMs, body });
         });
         return;
       }
@@ -848,7 +867,18 @@ function makeRequest(targetUrl, method, headers, payload) {
       }
       resolve({ retry: false, proxyRes });
     });
-    proxyReq.on('error', reject);
+    // Connect timeout — abort if TCP connection is not established promptly.
+    const connectTimer = setTimeout(() => {
+      proxyReq.destroy(new Error(`Connect timeout after ${CONNECT_TIMEOUT_MS}ms`));
+    }, CONNECT_TIMEOUT_MS);
+    // Response timeout — abort if the upstream socket is inactive for too long.
+    proxyReq.setTimeout(RESPONSE_TIMEOUT_MS, () => {
+      proxyReq.destroy(new Error(`Response timeout after ${RESPONSE_TIMEOUT_MS}ms`));
+    });
+    proxyReq.on('error', (err) => {
+      clearTimeout(connectTimer);
+      reject(err);
+    });
     if (payload) proxyReq.write(payload);
     proxyReq.end();
   });
@@ -929,198 +959,224 @@ function desanitizeSseLine(line) {
   }
 }
 
-function forwardRequest(req, res, body) {
-  return new Promise(async (resolve) => {
-    // Circuit breaker — reject immediately if auth is known-broken
-    const circuitState = circuitAllow();
-    if (!circuitState.ok) {
-      log(`[circuit] open — rejecting request, retry after ${circuitState.retryAfter}s`);
-      res.set('Retry-After', String(circuitState.retryAfter));
-      res.status(503).json({
-        type: 'error',
-        error: {
-          type: 'circuit_open',
-          message: `Auth temporarily unavailable — retrying in ${circuitState.retryAfter}s`,
-        },
-      });
-      return resolve();
-    }
+function parseUpstreamErrorBody(body, statusCode) {
+  try {
+    const parsed = JSON.parse(body);
+    if (parsed && typeof parsed === 'object') return parsed;
+  } catch {}
+  return {
+    type: 'error',
+    error: {
+      type: 'upstream_error',
+      message: `Upstream returned an invalid JSON error response (HTTP ${statusCode})`,
+    },
+  };
+}
 
-    let accessToken;
+async function forwardRequest(req, res, body, dependencies = {}) {
+  const getToken = dependencies.getAccessToken || getAccessToken;
+  const request = dependencies.makeRequest || makeRequest;
+  const sleep = dependencies.sleep || ((delayMs) => new Promise(r => setTimeout(r, delayMs)));
+  const refreshAuth = dependencies.refreshAuth || (async () => {
+    cachedCredentials = null;
+    readCredentials();
+    if (!cachedCredentials?.refreshToken) {
+      throw new Error('No refresh token available');
+    }
+    const freshCreds = await refreshToken(cachedCredentials);
+    PROXY_SESSION_ID = randomUUID();
+    syncAuthProfiles(freshCreds);
+    return freshCreds.accessToken;
+  });
+
+  // Circuit breaker — reject immediately if auth is known-broken
+  const circuitState = circuitAllow();
+  if (!circuitState.ok) {
+    log(`[circuit] open — rejecting request, retry after ${circuitState.retryAfter}s`);
+    res.set('Retry-After', String(circuitState.retryAfter));
+    res.status(503).json({
+      type: 'error',
+      error: {
+        type: 'circuit_open',
+        message: `Auth temporarily unavailable — retrying in ${circuitState.retryAfter}s`,
+      },
+    });
+    return;
+  }
+
+  let accessToken;
+  try {
+    accessToken = await getToken();
+  } catch (err) {
+    log('Auth error:', err.message);
+    res.status(401).json({
+      type: 'error',
+      error: {
+        type: 'proxy_auth_error',
+        message: err.message,
+        action: 'Run "claude auth login" to re-authenticate',
+      },
+    });
+    return;
+  }
+
+  const targetUrl = new URL(req.path, ANTHROPIC_BASE);
+  if (req.url.includes('?')) {
+    targetUrl.search = req.url.split('?')[1];
+  }
+
+  let headers = buildHeaders(accessToken, req);
+
+  const payload = body ? JSON.stringify(body) : undefined;
+  if (payload) {
+    headers['content-length'] = Buffer.byteLength(payload);
+  }
+
+  // Retry loop for transient 429s
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    debug(`→ ${req.method} ${targetUrl.toString()} (attempt ${attempt + 1})`);
+
+    let result;
     try {
-      accessToken = await getAccessToken();
+      result = await request(targetUrl, req.method, { ...headers }, payload);
     } catch (err) {
-      log('Auth error:', err.message);
-      res.status(401).json({
-        type: 'error',
-        error: {
-          type: 'proxy_auth_error',
-          message: err.message,
-          action: 'Run "claude auth login" to re-authenticate',
-        },
-      });
-      return resolve();
-    }
-
-    const targetUrl = new URL(req.path, ANTHROPIC_BASE);
-    if (req.url.includes('?')) {
-      targetUrl.search = req.url.split('?')[1];
-    }
-
-    let headers = buildHeaders(accessToken, req);
-
-    const payload = body ? JSON.stringify(body) : undefined;
-    if (payload) {
-      headers['content-length'] = Buffer.byteLength(payload);
-    }
-
-    // Retry loop for transient 429s
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      debug(`→ ${req.method} ${targetUrl.toString()} (attempt ${attempt + 1})`);
-
-      let result;
-      try {
-        result = await makeRequest(targetUrl, req.method, { ...headers }, payload);
-      } catch (err) {
-        log('Proxy request error:', err.message);
-        if (!res.headersSent) {
+      log('Proxy request error:', err.message);
+      if (!res.headersSent) {
+        // Distinguish upstream timeouts (504) from other transport errors (502)
+        if (err.message.includes('timeout')) {
+          res.status(504).json({
+            type: 'error',
+            error: { type: 'gateway_timeout', message: `Upstream timeout: ${err.message}` },
+          });
+        } else {
           res.status(502).json({
             type: 'error',
             error: { type: 'api_error', message: `Proxy error: ${err.message}` },
           });
         }
-        return resolve();
       }
+      return;
+    }
 
-      if (result.retry401) {
-        // Anthropic's token invalidation has eventual consistency — freshly
-        // refreshed tokens can be rejected for 30-60s while edge servers sync.
-        // Strategy: refresh + rotate session on first 401, then backoff retries.
-        // Circuit breaker trips after THRESHOLD consecutive total failures.
-        if (attempt === 0) {
-          // First 401: refresh token + rotate session ID
-          log(`[401] attempt=1 token=${accessToken.slice(0, 15)}... — refreshing + rotating session`);
-          try {
-            cachedCredentials = null;
-            readCredentials();
-            if (!cachedCredentials?.refreshToken) {
-              throw new Error('No refresh token available');
-            }
-            const freshCreds = await refreshToken(cachedCredentials);
-            accessToken = freshCreds.accessToken;
-            PROXY_SESSION_ID = randomUUID();
-            syncAuthProfiles(freshCreds);
-            headers = buildHeaders(accessToken, req);
-            if (payload) headers['content-length'] = Buffer.byteLength(payload);
-            log(`[401] retry: new_token=${accessToken.slice(0, 15)}... new_session=${PROXY_SESSION_ID.slice(0, 8)}`);
-          } catch (err) {
-            log(`[401] token refresh failed: ${err.message}`);
-            circuitFailure();
-            res.status(401).json(JSON.parse(result.body));
-            return resolve();
-          }
-          continue;
+    if (result.retry401) {
+      // Anthropic's token invalidation has eventual consistency — freshly
+      // refreshed tokens can be rejected for 30-60s while edge servers sync.
+      // Strategy: refresh + rotate session on first 401, then backoff retries.
+      // Circuit breaker trips after THRESHOLD consecutive total failures.
+      if (attempt === 0) {
+        // First 401: refresh token + rotate session ID
+        log(`[401] attempt=1 — refreshing + rotating session`);
+        try {
+          accessToken = await refreshAuth();
+          headers = buildHeaders(accessToken, req);
+          if (payload) headers['content-length'] = Buffer.byteLength(payload);
+          log(`[401] retry: refreshed — new_session=${PROXY_SESSION_ID.slice(0, 8)}`);
+        } catch (err) {
+          log(`[401] token refresh failed: ${err.message}`);
+          circuitFailure();
+          res.status(401).json(parseUpstreamErrorBody(result.body, 401));
+          return;
         }
-
-        if (attempt <= MAX_RETRIES) {
-          // Subsequent 401s: token propagation delay — wait and retry
-          const delayMs = RETRY_BASE_MS * Math.pow(2, attempt - 1); // 2s, 4s, 8s
-          log(`[401] attempt=${attempt + 1} — propagation delay, waiting ${delayMs}ms`);
-          await new Promise(r => setTimeout(r, delayMs));
-          continue;
-        }
-
-        // Exhausted all retries — trip the circuit breaker
-        log(`[401] exhausted all retries — tripping circuit breaker (failure #${circuit.failures + 1})`);
-        circuitFailure();
-        res.status(401).json(JSON.parse(result.body));
-        return resolve();
-      }
-
-      if (result.retry && attempt < MAX_RETRIES) {
-        const delayMs = result.retryAfterMs || (RETRY_BASE_MS * Math.pow(2, attempt));
-        log(`429 rate limited, retrying in ${delayMs}ms (attempt ${attempt + 2}/${MAX_RETRIES + 1})`);
-        await new Promise(r => setTimeout(r, delayMs));
         continue;
       }
 
-      if (result.retry) {
-        // Exhausted retries, return the 429
-        log(`429 rate limited, exhausted ${MAX_RETRIES + 1} attempts`);
-        res.status(429).json(JSON.parse(result.body));
-        return resolve();
+      if (attempt < MAX_RETRIES) {
+        // Subsequent 401s: token propagation delay — wait and retry
+        const delayMs = RETRY_BASE_MS * Math.pow(2, attempt - 1); // 2s, 4s, 8s
+        log(`[401] attempt=${attempt + 1} — propagation delay, waiting ${delayMs}ms`);
+        await sleep(delayMs);
+        continue;
       }
 
-      const { proxyRes } = result;
-      const sc = proxyRes.statusCode;
-      if (sc >= 400) {
-        const overageStatus = proxyRes.headers['anthropic-ratelimit-unified-overage-status'] || '';
-        const overageReason = proxyRes.headers['anthropic-ratelimit-unified-overage-disabled-reason'] || '';
-        const serviceTier = proxyRes.headers['anthropic-ratelimit-unified-tier'] || '';
-        log(`← ERROR ${sc} | overage=${overageStatus} | reason=${overageReason} | tier=${serviceTier}`);
+      // Exhausted all retries — trip the circuit breaker
+      log(`[401] exhausted all retries — tripping circuit breaker (failure #${circuit.failures + 1})`);
+      circuitFailure();
+      res.status(401).json(parseUpstreamErrorBody(result.body, 401));
+      return;
+    }
+
+    if (result.retry && attempt < MAX_RETRIES) {
+      const delayMs = Math.min(
+        result.retryAfterMs || (RETRY_BASE_MS * Math.pow(2, attempt)),
+        MAX_RETRY_AFTER_MS
+      );
+      log(`429 rate limited, retrying in ${delayMs}ms (attempt ${attempt + 2}/${MAX_RETRIES + 1})`);
+      await sleep(delayMs);
+      continue;
+    }
+
+    if (result.retry) {
+      // Exhausted retries, return the 429
+      log(`429 rate limited, exhausted ${MAX_RETRIES + 1} attempts`);
+      res.status(429).json(parseUpstreamErrorBody(result.body, 429));
+      return;
+    }
+
+    const { proxyRes } = result;
+    const sc = proxyRes.statusCode;
+    if (sc >= 400) {
+      const overageStatus = proxyRes.headers['anthropic-ratelimit-unified-overage-status'] || '';
+      const overageReason = proxyRes.headers['anthropic-ratelimit-unified-overage-disabled-reason'] || '';
+      const serviceTier = proxyRes.headers['anthropic-ratelimit-unified-tier'] || '';
+      log(`← ERROR ${sc} | overage=${overageStatus} | reason=${overageReason} | tier=${serviceTier}`);
+    }
+    debug(`← ${proxyRes.statusCode} ${proxyRes.statusMessage}`);
+
+    // Copy response headers
+    const skipHeaders = new Set(['transfer-encoding', 'connection', 'keep-alive']);
+    for (const [key, value] of Object.entries(proxyRes.headers)) {
+      if (!skipHeaders.has(key.toLowerCase())) {
+        res.setHeader(key, value);
       }
-      debug(`← ${proxyRes.statusCode} ${proxyRes.statusMessage}`);
+    }
+    res.status(proxyRes.statusCode);
 
-      // Copy response headers
-      const skipHeaders = new Set(['transfer-encoding', 'connection', 'keep-alive']);
-      for (const [key, value] of Object.entries(proxyRes.headers)) {
-        if (!skipHeaders.has(key.toLowerCase())) {
-          res.setHeader(key, value);
-        }
-      }
-      res.status(proxyRes.statusCode);
+    // Successful response — reset circuit breaker
+    if (proxyRes.statusCode < 400) circuitSuccess();
 
-      // Successful response — reset circuit breaker
-      if (proxyRes.statusCode < 400) circuitSuccess();
+    const contentType = proxyRes.headers['content-type'] || '';
+    const isSSE = contentType.includes('text/event-stream');
 
-      const contentType = proxyRes.headers['content-type'] || '';
-      const isSSE = contentType.includes('text/event-stream');
-
+    try {
       if (isSSE) {
         // SSE streaming — intercept each line and reverse tool renames
         let buffer = '';
         proxyRes.setEncoding('utf8');
-        proxyRes.on('data', (chunk) => {
+        for await (const chunk of proxyRes) {
           buffer += chunk;
           const lines = buffer.split('\n');
           buffer = lines.pop(); // keep incomplete last line
           for (const line of lines) {
             res.write(desanitizeSseLine(line) + '\n');
           }
-        });
-        proxyRes.on('end', () => {
-          if (buffer) res.write(desanitizeSseLine(buffer) + '\n');
-          res.end();
-          resolve();
-        });
+        }
+        if (buffer) res.write(desanitizeSseLine(buffer) + '\n');
+        res.end();
       } else {
         // Non-streaming JSON — buffer full response, reverse tool renames, forward
         const chunks = [];
-        proxyRes.on('data', (chunk) => chunks.push(chunk));
-        proxyRes.on('end', () => {
-          const raw = Buffer.concat(chunks).toString('utf8');
-          if (sc >= 400) log(`← ERROR body: ${raw.slice(0, 300)}`);
-          try {
-            const parsed = JSON.parse(raw);
-            const fixed = desanitizeResponseJson(parsed);
-            const out = JSON.stringify(fixed);
-            res.setHeader('content-length', Buffer.byteLength(out));
-            res.end(out);
-          } catch {
-            // Not JSON (unlikely) — pass through as-is
-            res.end(raw);
-          }
-          resolve();
-        });
+        for await (const chunk of proxyRes) chunks.push(chunk);
+        const raw = Buffer.concat(chunks).toString('utf8');
+        if (sc >= 400) log(`← ERROR body: ${raw.slice(0, 300)}`);
+        try {
+          const parsed = JSON.parse(raw);
+          const fixed = desanitizeResponseJson(parsed);
+          const out = JSON.stringify(fixed);
+          res.setHeader('content-length', Buffer.byteLength(out));
+          res.end(out);
+        } catch {
+          // Not JSON (unlikely) — pass through as-is
+          res.end(raw);
+        }
       }
-
-      proxyRes.on('error', (err) => {
-        log('Response stream error:', err.message);
-        resolve();
-      });
-      return; // Exit the retry loop
+    } catch (err) {
+      // Upstream stream failed mid-response — abort the client connection so
+      // it does not hang waiting for a body that will never complete.
+      log('Response stream error:', err.message);
+      if (!res.destroyed) res.destroy(err);
     }
-  });
+    return; // Exit the retry loop
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1351,5 +1407,16 @@ if (require.main !== module) {
     createDebugDumpPath,
     writeDump,
     createDebugDumpRegistry,
+    MAX_RETRIES,
+    MAX_RETRY_AFTER_MS,
+    CONNECT_TIMEOUT_MS,
+    RESPONSE_TIMEOUT_MS,
+    circuit,
+    circuitAllow,
+    circuitSuccess,
+    circuitFailure,
+    forwardRequest,
+    makeRequest,
+    parseUpstreamErrorBody,
   };
 }
