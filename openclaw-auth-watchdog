@@ -10,37 +10,22 @@ PLIST="$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"
 LOG="/tmp/openclaw-auth-watchdog.log"
 REPAIRED=0
 GATEWAY_NEEDS_RESTART=0
-NODE="${NODE:-$(command -v node)}"
-if [ -z "$NODE" ]; then
-  log "ERROR: node not found in PATH"
-  exit 1
-fi
+# Native plist editor. The target is a macOS LaunchAgent plist, so the host is
+# macOS by definition; PlistBuddy lives at this fixed path on every install and
+# handles xml1 AND binary plists with any formatting.
+PLISTBUDDY="/usr/libexec/PlistBuddy"
+PROXY_SECRET_FILE="$HOME/.claude-max-proxy-secret"
 AUTH_PROFILES="$HOME/.openclaw/agents/main/agent/auth-profiles.json"
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"
 }
 
-# Proxy secret — required by /v1/messages and /force-refresh on the proxy.
-# Resolution order matches the proxy itself: env, then the file persisted by
-# setup.sh. Never log the secret value.
-PROXY_SECRET="${PROXY_SECRET:-}"
-PROXY_SECRET_FILE="$HOME/.claude-max-proxy-secret"
-if [ -z "$PROXY_SECRET" ] && [ -f "$PROXY_SECRET_FILE" ]; then
-  # Canonical secret read rule — shared with index.js and setup.sh:
-  # FIRST LINE of the file, TRIMMED of surrounding whitespace.
-  PROXY_SECRET=$(head -n 1 "$PROXY_SECRET_FILE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+NODE="${NODE:-$(command -v node)}"
+if [ -z "$NODE" ]; then
+  log "ERROR: node not found in PATH"
+  exit 1
 fi
-# setup.sh generates hex secrets; anything outside [A-Za-z0-9_-] would need
-# XML escaping when injected into the plist. Warn and skip injection instead
-# (the proxy itself refuses to start on such a secret).
-case "$PROXY_SECRET" in
-  *[!A-Za-z0-9_-]*)
-    log "WARNING: proxy secret contains characters outside [A-Za-z0-9_-] — ignoring it (fix the secret, e.g. regenerate with setup.sh)"
-    PROXY_SECRET=""
-    ;;
-esac
-export WATCHDOG_PROXY_SECRET="$PROXY_SECRET"
 
 # Run a node script from a string, passing $1 as process.argv[1].
 # Uses `node -e` with the script as an argument so nothing depends on stdin
@@ -56,64 +41,128 @@ run_node() {
   "$NODE" -e "$script" "$arg"
 }
 
-if [ ! -f "$CONFIG" ]; then
-  log "ERROR: openclaw.json not found at $CONFIG"
-  exit 1
-fi
-
-# ── Check 1: plist env vars ──────────────────────────────────────────────────
+# ── Check 1 implementation: plist env vars via native plist tools ────────────
+# Uses PlistBuddy (never string/regex surgery on the XML), so xml1 and binary
+# formats, CRLF line endings, arbitrary indentation, and any key position
+# (EnvironmentVariables not last, nested dicts after it) are all handled.
+# Every write is re-read and compared before being reported as a repair; a
+# mismatch is an ERROR, never a false "repaired".
+#
 # ANTHROPIC_BASE_URL: restore if missing.
 # ANTHROPIC_API_KEY carries the proxy secret. Never write a placeholder: with
 # no resolvable secret, skip that repair (a stale placeholder would shadow a
 # real secret created later, since presence checks alone would never replace
 # it). With a secret, insert it if missing and SYNCHRONIZE a differing value
-# (including the legacy "claude-max-proxy" placeholder).
-if [ -f "$PLIST" ]; then
-  PLIST_REPAIR_OUT=$(run_node '
-const fs = require("fs");
-const path = process.argv[1];
-const secret = process.env.WATCHDOG_PROXY_SECRET || "";
-let content = fs.readFileSync(path, "utf8");
-let changed = false;
+# (including the legacy "claude-max-proxy" placeholder). The secret charset is
+# validated to [A-Za-z0-9_-] before use, so expanding it inside a PlistBuddy
+# -c command string is quoting-safe. Never log the secret value.
 
-const insertVar = (key, value) => {
-  content = content.replace("</dict>\n</dict>", "    <key>" + key + "</key>\n    <string>" + value + "</string>\n    </dict>\n</dict>");
-  changed = true;
-  console.log("Added " + key);
-};
-
-if (!content.includes("<key>ANTHROPIC_BASE_URL</key>")) {
-  insertVar("ANTHROPIC_BASE_URL", "http://127.0.0.1:4523");
+# Ensure :EnvironmentVariables exists as a dict so Adds below have a parent.
+plist_ensure_env_dict() {
+  local plist="$1"
+  if ! "$PLISTBUDDY" -c 'Print :EnvironmentVariables' "$plist" >/dev/null 2>&1; then
+    "$PLISTBUDDY" -c 'Add :EnvironmentVariables dict' "$plist" 2>/dev/null
+  fi
 }
 
-const keyRe = /(<key>ANTHROPIC_API_KEY<\/key>\s*<string>)([^<]*)(<\/string>)/;
-const m = content.match(keyRe);
-if (!secret) {
-  if (!m) console.log("NOSECRET");
-} else if (!m) {
-  insertVar("ANTHROPIC_API_KEY", secret);
-} else if (m[2] !== secret) {
-  // Function replacement: the secret is charset-validated above, but this
-  // also keeps replacement-pattern characters ($&, $1, ...) inert.
-  content = content.replace(keyRe, (_, pre, _stale, post) => pre + secret + post);
-  changed = true;
-  console.log("Synchronized ANTHROPIC_API_KEY with the proxy secret");
-}
+# repair_plist_env <plist-path>
+# Reads PROXY_SECRET; logs its findings; sets REPAIRED=1 only after a write
+# has been re-read and verified. Returns non-zero if a write failed to verify.
+repair_plist_env() {
+  local plist="$1"
+  local changed=0 verify_failed=0 nosecret=0 has_key=0
+  local notes="" action="" current="" now=""
 
-if (changed) {
-  fs.writeFileSync(path, content);
-  fs.chmodSync(path, 0o600); // plist embeds the proxy secret — keep owner-only
-  console.log("CHANGED");
-}
-' "$PLIST")
-  if echo "$PLIST_REPAIR_OUT" | grep -q "CHANGED"; then
-    log "WARNING: plist env vars repaired — $(echo "$PLIST_REPAIR_OUT" | grep -v '^CHANGED$' | tr '\n' ' ')"
+  # ANTHROPIC_BASE_URL: restore if missing.
+  if ! "$PLISTBUDDY" -c 'Print :EnvironmentVariables:ANTHROPIC_BASE_URL' "$plist" >/dev/null 2>&1; then
+    plist_ensure_env_dict "$plist"
+    "$PLISTBUDDY" -c 'Add :EnvironmentVariables:ANTHROPIC_BASE_URL string http://127.0.0.1:4523' "$plist" 2>/dev/null
+    now=$("$PLISTBUDDY" -c 'Print :EnvironmentVariables:ANTHROPIC_BASE_URL' "$plist" 2>/dev/null)
+    if [ "$now" = "http://127.0.0.1:4523" ]; then
+      changed=1
+      notes="$notes Added ANTHROPIC_BASE_URL."
+    else
+      verify_failed=1
+      log "ERROR: plist write for ANTHROPIC_BASE_URL did not verify — check $plist"
+    fi
+  fi
+
+  # ANTHROPIC_API_KEY (the proxy secret).
+  current=$("$PLISTBUDDY" -c 'Print :EnvironmentVariables:ANTHROPIC_API_KEY' "$plist" 2>/dev/null)
+  has_key=$?
+  if [ -z "$PROXY_SECRET" ]; then
+    nosecret=1
+    if [ "$has_key" -eq 0 ]; then
+      # A key exists but there is nothing to compare it against — it may be a
+      # stale legacy placeholder. Never claim "in sync" here.
+      log "WARNING: cannot verify/sync ANTHROPIC_API_KEY (no proxy secret resolvable); existing value may be stale (set PROXY_SECRET or create $PROXY_SECRET_FILE)"
+    else
+      log "WARNING: plist missing ANTHROPIC_API_KEY but no proxy secret is resolvable — skipping that repair (set PROXY_SECRET or create $PROXY_SECRET_FILE)"
+    fi
+  elif [ "$has_key" -ne 0 ] || [ "$current" != "$PROXY_SECRET" ]; then
+    if [ "$has_key" -ne 0 ]; then
+      plist_ensure_env_dict "$plist"
+      "$PLISTBUDDY" -c "Add :EnvironmentVariables:ANTHROPIC_API_KEY string $PROXY_SECRET" "$plist" 2>/dev/null
+      action="Added ANTHROPIC_API_KEY."
+    else
+      "$PLISTBUDDY" -c "Set :EnvironmentVariables:ANTHROPIC_API_KEY $PROXY_SECRET" "$plist" 2>/dev/null
+      action="Synchronized ANTHROPIC_API_KEY with the proxy secret."
+    fi
+    now=$("$PLISTBUDDY" -c 'Print :EnvironmentVariables:ANTHROPIC_API_KEY' "$plist" 2>/dev/null)
+    if [ "$now" = "$PROXY_SECRET" ]; then
+      changed=1
+      notes="$notes $action"
+    else
+      verify_failed=1
+      log "ERROR: plist write for ANTHROPIC_API_KEY did not verify (on-disk value does not match the proxy secret) — not reporting it repaired; check $plist"
+    fi
+  fi
+
+  if [ "$changed" -eq 1 ]; then
+    chmod 600 "$plist" # plist embeds the proxy secret — keep owner-only
+    log "WARNING: plist env vars repaired —$notes"
     REPAIRED=1
-  elif echo "$PLIST_REPAIR_OUT" | grep -q "NOSECRET"; then
-    log "WARNING: plist missing ANTHROPIC_API_KEY but no proxy secret is resolvable — skipping that repair (set PROXY_SECRET or create $PROXY_SECRET_FILE)"
-  else
+  fi
+  if [ "$changed" -eq 0 ] && [ "$verify_failed" -eq 0 ] && [ "$nosecret" -eq 0 ]; then
     log "OK: plist env vars present and in sync"
   fi
+  return "$verify_failed"
+}
+
+# Test hook: when this file is sourced (test/watchdog-plist.test.js does this
+# to exercise repair_plist_env against fixture plists), stop after the
+# definitions above — do not run the live checks below.
+if (return 0 2>/dev/null); then
+  return 0
+fi
+
+# Proxy secret — required by /v1/messages and /force-refresh on the proxy.
+# Resolution order matches the proxy itself: env, then the file persisted by
+# setup.sh. Never log the secret value.
+PROXY_SECRET="${PROXY_SECRET:-}"
+if [ -z "$PROXY_SECRET" ] && [ -f "$PROXY_SECRET_FILE" ]; then
+  # Canonical secret read rule — shared with index.js and setup.sh:
+  # FIRST LINE of the file, TRIMMED of surrounding whitespace.
+  PROXY_SECRET=$(head -n 1 "$PROXY_SECRET_FILE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+fi
+# setup.sh generates hex secrets; anything outside [A-Za-z0-9_-] would need
+# escaping when injected into the plist. Warn and skip injection instead
+# (the proxy itself refuses to start on such a secret).
+case "$PROXY_SECRET" in
+  *[!A-Za-z0-9_-]*)
+    log "WARNING: proxy secret contains characters outside [A-Za-z0-9_-] — ignoring it (fix the secret, e.g. regenerate with setup.sh)"
+    PROXY_SECRET=""
+    ;;
+esac
+
+if [ ! -f "$CONFIG" ]; then
+  log "ERROR: openclaw.json not found at $CONFIG"
+  exit 1
+fi
+
+# ── Check 1: plist env vars (see repair_plist_env above) ─────────────────────
+if [ -f "$PLIST" ]; then
+  repair_plist_env "$PLIST"
 fi
 
 # ── Check 2: openclaw.json auth profile ──────────────────────────────────────

@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "test": "PROXY_TEST=1 node test/tool-desanitize.test.js && PROXY_TEST=1 node test/dump-security.test.js && PROXY_TEST=1 node test/circuit-retry.test.js && PROXY_TEST=1 node test/auth.test.js && PROXY_TEST=1 node test/route-auth.test.js && PROXY_TEST=1 node test/no-token-logging.test.js && PROXY_TEST=1 node test/timeouts.test.js"
+    "test": "PROXY_TEST=1 node test/tool-desanitize.test.js && PROXY_TEST=1 node test/dump-security.test.js && PROXY_TEST=1 node test/circuit-retry.test.js && PROXY_TEST=1 node test/auth.test.js && PROXY_TEST=1 node test/route-auth.test.js && PROXY_TEST=1 node test/no-token-logging.test.js && PROXY_TEST=1 node test/timeouts.test.js && PROXY_TEST=1 node test/watchdog-plist.test.js"
   },
   "keywords": [
     "claude",
