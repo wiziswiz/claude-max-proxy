@@ -120,7 +120,13 @@ repair_plist_env() {
 
   if [ "$changed" -eq 1 ]; then
     chmod 600 "$plist" # plist embeds the proxy secret — keep owner-only
-    log "WARNING: plist env vars repaired —$notes"
+    if [ "$verify_failed" -eq 1 ]; then
+      # One var repaired but another failed verification: do not claim overall
+      # repair success — the ERROR above already names the failed var.
+      log "WARNING: plist env vars partially repaired —$notes (another repair FAILED verification; see ERROR above)"
+    else
+      log "WARNING: plist env vars repaired —$notes"
+    fi
     REPAIRED=1
   fi
   if [ "$changed" -eq 0 ] && [ "$verify_failed" -eq 0 ] && [ "$nosecret" -eq 0 ]; then
@@ -161,8 +167,13 @@ if [ ! -f "$CONFIG" ]; then
 fi
 
 # ── Check 1: plist env vars (see repair_plist_env above) ─────────────────────
+# CHECK_FAILED propagates a verification failure to the final exit code — a
+# repair that did not verify must not let the watchdog report overall success.
+CHECK_FAILED=0
 if [ -f "$PLIST" ]; then
-  repair_plist_env "$PLIST"
+  repair_plist_env "$PLIST" || CHECK_FAILED=1
+else
+  log "WARNING: LaunchAgent plist not found at $PLIST — launch persistence may be lost (run setup.sh to reinstall)"
 fi
 
 # ── Check 2: openclaw.json auth profile ──────────────────────────────────────
@@ -403,4 +414,8 @@ else
   log "WARNING: proxy not responding at $PROXY_URL"
 fi
 
+if [ "$CHECK_FAILED" -ne 0 ]; then
+  log "Done (with errors: a plist repair did not verify — see ERROR above)"
+  exit 1
+fi
 log "Done"
