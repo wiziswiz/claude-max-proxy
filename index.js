@@ -1357,8 +1357,15 @@ if (!process.env.PROXY_TEST) {
   app.listen(PORT, '127.0.0.1', () => {
     log(`claude-max-proxy v${require('./package.json').version} (oauth-proxy mode)`);
     log(`Listening on http://127.0.0.1:${PORT}`);
-    if (GENERATED_PROXY_SECRET) log('Proxy secret: ' + PROXY_SECRET);
-    log('  Set header: Authorization: Bearer ' + PROXY_SECRET);
+    if (GENERATED_PROXY_SECRET) {
+      // Secret was auto-generated this boot — printing it is the only way the
+      // user can learn it (documented UX).
+      log('Proxy secret: ' + PROXY_SECRET);
+      log('  Set header: Authorization: Bearer ' + PROXY_SECRET);
+    } else {
+      log('Proxy secret: (set via env)');
+      log('  Set header: Authorization: Bearer <PROXY_SECRET>');
+    }
     log(`Proxying → ${ANTHROPIC_BASE} (with CLI OAuth credentials)`);
     log(`OpenClaw sanitization: ${SANITIZE_OPENCLAW ? 'enabled' : 'disabled'}`);
     log(`Tool name mode: ${NORMALIZE_TOOL_NAMES ? 'normalize' : 'preserve'}`);
@@ -1371,7 +1378,7 @@ if (!process.env.PROXY_TEST) {
     log('');
     log('Configure your app to use:');
     log(`  Base URL: http://127.0.0.1:${PORT}`);
-    log('  Authorization: Bearer ' + PROXY_SECRET);
+    log('  Authorization: Bearer ' + (GENERATED_PROXY_SECRET ? PROXY_SECRET : '<PROXY_SECRET> (set via env)'));
     log('');
     if (DEBUG) log('Debug mode enabled');
   });
