@@ -71,6 +71,8 @@ Where the secret comes from, in order:
 2. `~/.claude-max-proxy-secret` — created by `./setup.sh` (owner-only, `0600`) and shared by the service, the watchdog, and your client configs
 3. Otherwise a random secret is generated at startup and printed once in the proxy log
 
+All three readers of the secret file (the proxy, `setup.sh`, and `openclaw-auth-watchdog`) use the same canonical rule: **first line of the file, trimmed of surrounding whitespace**. The secret must contain only `[A-Za-z0-9_-]` (setup.sh generates hex, which always qualifies) — the proxy refuses to start on any other value, and the watchdog refuses to inject it, so it never needs XML or systemd escaping.
+
 > **Migration note:** earlier versions accepted *any* API key value (e.g. `"claude-max-proxy"`). That is no longer true — the value must now equal your `PROXY_SECRET`. Existing client configs keep working as-is once you replace the placeholder value with the real secret (run `./setup.sh` to generate and persist one, or read it from `~/.claude-max-proxy-secret`).
 
 | App | Setting | Value |

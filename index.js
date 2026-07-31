@@ -66,8 +66,12 @@ const PROXY_SECRET_FILE = join(homedir(), '.claude-max-proxy-secret');
 
 function readPersistedProxySecret() {
   try {
-    const raw = readFileSync(PROXY_SECRET_FILE, 'utf-8').trim();
-    if (raw) return raw;
+    // Canonical secret read rule — shared with setup.sh and
+    // openclaw-auth-watchdog: FIRST LINE of the file, TRIMMED of
+    // surrounding whitespace. Keep all three readers in sync.
+    const raw = readFileSync(PROXY_SECRET_FILE, 'utf-8');
+    const firstLine = raw.split('\n', 1)[0].trim();
+    if (firstLine) return firstLine;
   } catch {}
   return null;
 }
@@ -88,6 +92,22 @@ if (process.env.PROXY_SECRET) {
     PROXY_SECRET_SOURCE = 'generated';
   }
 }
+
+// setup.sh generates hex secrets, and the secret travels through XML plists,
+// systemd unit files, and shell scripts. Enforcing the safe charset here makes
+// escaping in all of those moot: anything outside [A-Za-z0-9_-] is refused at
+// startup with a pointer at the offending source. (Generated secrets are hex
+// and always pass.)
+if (!/^[A-Za-z0-9_-]+$/.test(PROXY_SECRET)) {
+  const secretOrigin = PROXY_SECRET_SOURCE === 'env'
+    ? 'the PROXY_SECRET env var'
+    : PROXY_SECRET_FILE;
+  console.error(`FATAL: proxy secret (from ${secretOrigin}) contains characters outside [A-Za-z0-9_-].`);
+  console.error('Fix the secret and restart — regenerate with ./setup.sh, or run:');
+  console.error('  openssl rand -hex 24 > ~/.claude-max-proxy-secret && chmod 600 ~/.claude-max-proxy-secret');
+  process.exit(1);
+}
+
 let PROXY_SESSION_ID = randomUUID();
 
 function log(...args) {
@@ -869,8 +889,26 @@ function makeRequest(targetUrl, method, headers, payload) {
     const transport = targetUrl.protocol === 'https:' ? https : http;
     const proxyReq = transport.request(targetUrl, { method, headers }, (proxyRes) => {
       clearTimeout(connectTimer);
+      // The intercepted 429/401 branches below buffer the upstream body here.
+      // If the upstream resets mid-body, proxyRes emits 'aborted'/'error' —
+      // with no handler that is either an uncaught 'error' (process crash) or
+      // a forever-pending promise ('end' never fires → forwardRequest's
+      // finally never runs → probe slot wedged). Reject instead: the caller
+      // classifies it as a transport error (502/504), releases the probe
+      // slot, and leaves the circuit state untouched. Settling twice is a
+      // no-op, so racing with resolve() on 'end' is safe.
+      const rejectOnBodyAbort = () => {
+        const onAbort = (err) => {
+          reject(err instanceof Error
+            ? err
+            : Object.assign(new Error('Upstream connection aborted mid-body'), { code: 'ECONNRESET' }));
+        };
+        proxyRes.on('error', onAbort);
+        proxyRes.on('aborted', onAbort);
+      };
       if (proxyRes.statusCode === 429 && proxyRes.headers['x-should-retry'] === 'true') {
         // Consume body so connection can be reused, then signal retry
+        rejectOnBodyAbort();
         let body = '';
         proxyRes.on('data', (d) => { body += d; });
         proxyRes.on('end', () => {
@@ -884,6 +922,7 @@ function makeRequest(targetUrl, method, headers, payload) {
         return;
       }
       if (proxyRes.statusCode === 401) {
+        rejectOnBodyAbort();
         const wwwAuth = proxyRes.headers['www-authenticate'] || '';
         let body = '';
         proxyRes.on('data', (d) => { body += d; });
@@ -1276,9 +1315,15 @@ function secretMatches(candidate) {
 // (Anthropic SDKs send x-api-key; others send Authorization: Bearer) keep
 // working — only the VALUE must equal PROXY_SECRET.
 function requireSecret(req, res, next) {
-  const auth = req.headers['authorization'] || '';
+  // Headers can arrive array-shaped (repeated header lines) — a non-string
+  // must fail auth with 401, never throw. secretMatches() already rejects
+  // non-strings; the typeof guards keep .startsWith off arrays and mirror
+  // the same rule for both header forms.
+  const rawAuth = req.headers['authorization'];
+  const auth = typeof rawAuth === 'string' ? rawAuth : '';
   const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-  const apiKey = req.headers['x-api-key'];
+  const rawApiKey = req.headers['x-api-key'];
+  const apiKey = typeof rawApiKey === 'string' ? rawApiKey : '';
   const ok = secretMatches(bearer) || secretMatches(apiKey);
   if (!ok) {
     return res.status(401).json({ type: 'error', error: { type: 'unauthorized', message: 'Invalid or missing proxy secret — send "Authorization: Bearer <PROXY_SECRET>" or "x-api-key: <PROXY_SECRET>"' } });

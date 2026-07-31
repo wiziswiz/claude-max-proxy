@@ -73,11 +73,23 @@ else
   echo "Proxy secret: generated and saved to $SECRET_FILE"
 fi
 chmod 600 "$SECRET_FILE"
-PROXY_SECRET_VALUE=$(tr -d '[:space:]' < "$SECRET_FILE")
+# Canonical secret read rule — shared with index.js and openclaw-auth-watchdog:
+# FIRST LINE of the file, TRIMMED of surrounding whitespace.
+PROXY_SECRET_VALUE=$(head -n 1 "$SECRET_FILE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 if [ -z "$PROXY_SECRET_VALUE" ]; then
   echo "ERROR: could not read proxy secret from $SECRET_FILE"
   exit 1
 fi
+# Secrets generated above are hex; anything outside [A-Za-z0-9_-] would need
+# XML/systemd escaping in the service files below. Refuse instead — the proxy
+# and the watchdog enforce the same rule.
+case "$PROXY_SECRET_VALUE" in
+  *[!A-Za-z0-9_-]*)
+    echo "ERROR: proxy secret in $SECRET_FILE contains characters outside [A-Za-z0-9_-]."
+    echo "  Regenerate it (e.g. 'openssl rand -hex 24 > $SECRET_FILE') and re-run setup."
+    exit 1
+    ;;
+esac
 
 # ── macOS: LaunchAgent ─────────────────────────────────────────────────────────
 if [ "$(uname)" = "Darwin" ]; then

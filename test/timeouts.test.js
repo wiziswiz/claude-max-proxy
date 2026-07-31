@@ -22,6 +22,7 @@ const {
   forwardRequest,
   makeRequest,
   circuit,
+  circuitAllow,
 } = require('../index.js');
 
 let passed = 0;
@@ -265,6 +266,88 @@ function dependencies(overrides = {}) {
       );
       assert.strictEqual(result.retry, true);
       assert.strictEqual(result.retryAfterMs, 2000);
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+    }
+  });
+
+  console.log('\nAborted upstream body on intercepted 401/429');
+
+  // Upstream that sends headers plus a partial body, then resets the
+  // connection before the promised content-length completes. Before the fix,
+  // the intercepted 401/429 branches in makeRequest had no 'error'/'aborted'
+  // handlers on proxyRes: the reset either crashed the process (uncaught
+  // ECONNRESET) or left the promise pending forever, wedging the probe slot.
+  function abortMidBodyServer(statusCode, extraHeaders = {}) {
+    return http.createServer((req, resp) => {
+      resp.writeHead(statusCode, {
+        'content-type': 'application/json',
+        'content-length': '1000',
+        ...extraHeaders,
+      });
+      resp.write('{"error":{"type":"authentication_error","message":"');
+      setTimeout(() => resp.destroy(), 20);
+    });
+  }
+
+  // Converts a wedged (never-settling) forwardRequest into a clean assert
+  // failure instead of hanging the whole test run.
+  function withWedgeGuard(promise, ms = 5000) {
+    return Promise.race([
+      promise.then(() => 'settled'),
+      new Promise((resolve) => setTimeout(() => resolve('wedged'), ms).unref()),
+    ]);
+  }
+
+  await test('intercepted 401 aborted mid-body → clean 502 JSON, probe released, next request admitted', async () => {
+    resetCircuit();
+    // Open the circuit with an expired cooldown so THIS request is admitted
+    // as the single half-open probe.
+    circuit.state = 'open';
+    circuit.failures = circuit.THRESHOLD;
+    circuit.openedAt = Date.now() - circuit.COOLDOWN_MS - 1000;
+
+    const server = abortMidBodyServer(401);
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const port = server.address().port;
+      const res = makeResponse();
+      const outcome = await withWedgeGuard(forwardRequest(makeReq(), res, {}, dependencies({
+        makeRequest: (url, method, headers, payload) =>
+          makeRequest(new URL(url.pathname, `http://127.0.0.1:${port}`), method, headers, payload),
+      })));
+      assert.strictEqual(outcome, 'settled', 'forwardRequest settled (probe not wedged, process not crashed)');
+      // Classified as a transport error: clean JSON 502, not a crash
+      assert.strictEqual(res.statusCode, 502);
+      assert.strictEqual(res.body.type, 'error');
+      assert.strictEqual(res.body.error.type, 'api_error');
+      // Probe slot released; circuit state untouched (no auth evidence either way)
+      assert.strictEqual(circuit.probeInFlight, false);
+      assert.strictEqual(circuit.state, 'half-open');
+      // Next request is admitted to re-probe
+      assert.strictEqual(circuitAllow().ok, true, 'next request admitted after aborted probe');
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+    }
+  });
+
+  await test('retryable 429 aborted mid-body → clean 502 JSON, circuit untouched', async () => {
+    resetCircuit();
+    const server = abortMidBodyServer(429, { 'x-should-retry': 'true', 'retry-after': '1' });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const port = server.address().port;
+      const res = makeResponse();
+      const outcome = await withWedgeGuard(forwardRequest(makeReq(), res, {}, dependencies({
+        makeRequest: (url, method, headers, payload) =>
+          makeRequest(new URL(url.pathname, `http://127.0.0.1:${port}`), method, headers, payload),
+      })));
+      assert.strictEqual(outcome, 'settled', 'forwardRequest settled (did not wedge)');
+      assert.strictEqual(res.statusCode, 502);
+      assert.strictEqual(res.body.error.type, 'api_error');
+      assert.strictEqual(circuit.state, 'closed');
+      assert.strictEqual(circuit.failures, 0);
+      assert.strictEqual(circuit.probeInFlight, false);
     } finally {
       await new Promise(resolve => server.close(resolve));
     }

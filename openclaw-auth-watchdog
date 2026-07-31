@@ -27,23 +27,33 @@ log() {
 PROXY_SECRET="${PROXY_SECRET:-}"
 PROXY_SECRET_FILE="$HOME/.claude-max-proxy-secret"
 if [ -z "$PROXY_SECRET" ] && [ -f "$PROXY_SECRET_FILE" ]; then
-  PROXY_SECRET=$(tr -d '[:space:]' < "$PROXY_SECRET_FILE")
+  # Canonical secret read rule — shared with index.js and setup.sh:
+  # FIRST LINE of the file, TRIMMED of surrounding whitespace.
+  PROXY_SECRET=$(head -n 1 "$PROXY_SECRET_FILE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 fi
+# setup.sh generates hex secrets; anything outside [A-Za-z0-9_-] would need
+# XML escaping when injected into the plist. Warn and skip injection instead
+# (the proxy itself refuses to start on such a secret).
+case "$PROXY_SECRET" in
+  *[!A-Za-z0-9_-]*)
+    log "WARNING: proxy secret contains characters outside [A-Za-z0-9_-] — ignoring it (fix the secret, e.g. regenerate with setup.sh)"
+    PROXY_SECRET=""
+    ;;
+esac
 export WATCHDOG_PROXY_SECRET="$PROXY_SECRET"
 
 # Run a node script from a string, passing $1 as process.argv[1].
-# Uses a temp file to avoid stdin dependency (heredoc breaks when stdin is unavailable,
-# e.g. when called via execFile from the Telegram trigger).
+# Uses `node -e` with the script as an argument so nothing depends on stdin
+# (heredoc breaks when stdin is unavailable, e.g. when called via execFile
+# from the Telegram trigger). NOTE: with -e, node puts the first program
+# argument at process.argv[1] — which is what every embedded script reads.
+# (Running a temp .js FILE instead would shift the target to argv[2] and
+# every script would silently read/write the temp file — do not "simplify"
+# this back to a temp file without re-indexing argv in all call sites.)
 run_node() {
   local script="$1"
   local arg="$2"
-  local tmp
-  tmp=$(mktemp /tmp/watchdog-node-XXXXXX.js)
-  echo "$script" > "$tmp"
-  "$NODE" "$tmp" "$arg"
-  local rc=$?
-  rm -f "$tmp"
-  return $rc
+  "$NODE" -e "$script" "$arg"
 }
 
 if [ ! -f "$CONFIG" ]; then
@@ -52,29 +62,57 @@ if [ ! -f "$CONFIG" ]; then
 fi
 
 # ── Check 1: plist env vars ──────────────────────────────────────────────────
+# ANTHROPIC_BASE_URL: restore if missing.
+# ANTHROPIC_API_KEY carries the proxy secret. Never write a placeholder: with
+# no resolvable secret, skip that repair (a stale placeholder would shadow a
+# real secret created later, since presence checks alone would never replace
+# it). With a secret, insert it if missing and SYNCHRONIZE a differing value
+# (including the legacy "claude-max-proxy" placeholder).
 if [ -f "$PLIST" ]; then
-  MISSING_VARS=""
-  grep -q "ANTHROPIC_API_KEY" "$PLIST" || MISSING_VARS="$MISSING_VARS ANTHROPIC_API_KEY"
-  grep -q "ANTHROPIC_BASE_URL" "$PLIST" || MISSING_VARS="$MISSING_VARS ANTHROPIC_BASE_URL"
-
-  if [ -n "$MISSING_VARS" ]; then
-    log "WARNING: plist missing env vars:$MISSING_VARS — restoring"
-    run_node '
+  PLIST_REPAIR_OUT=$(run_node '
 const fs = require("fs");
 const path = process.argv[1];
+const secret = process.env.WATCHDOG_PROXY_SECRET || "";
 let content = fs.readFileSync(path, "utf8");
-const vars = { ANTHROPIC_API_KEY: process.env.WATCHDOG_PROXY_SECRET || "claude-max-proxy", ANTHROPIC_BASE_URL: "http://127.0.0.1:4523" };
-for (const [key, value] of Object.entries(vars)) {
-  if (!content.includes("<key>" + key + "</key>")) {
-    content = content.replace("</dict>\n</dict>", "    <key>" + key + "</key>\n    <string>" + value + "</string>\n    </dict>\n</dict>");
-    console.log("Added " + key);
-  }
+let changed = false;
+
+const insertVar = (key, value) => {
+  content = content.replace("</dict>\n</dict>", "    <key>" + key + "</key>\n    <string>" + value + "</string>\n    </dict>\n</dict>");
+  changed = true;
+  console.log("Added " + key);
+};
+
+if (!content.includes("<key>ANTHROPIC_BASE_URL</key>")) {
+  insertVar("ANTHROPIC_BASE_URL", "http://127.0.0.1:4523");
 }
-fs.writeFileSync(path, content);
-' "$PLIST"
+
+const keyRe = /(<key>ANTHROPIC_API_KEY<\/key>\s*<string>)([^<]*)(<\/string>)/;
+const m = content.match(keyRe);
+if (!secret) {
+  if (!m) console.log("NOSECRET");
+} else if (!m) {
+  insertVar("ANTHROPIC_API_KEY", secret);
+} else if (m[2] !== secret) {
+  // Function replacement: the secret is charset-validated above, but this
+  // also keeps replacement-pattern characters ($&, $1, ...) inert.
+  content = content.replace(keyRe, (_, pre, _stale, post) => pre + secret + post);
+  changed = true;
+  console.log("Synchronized ANTHROPIC_API_KEY with the proxy secret");
+}
+
+if (changed) {
+  fs.writeFileSync(path, content);
+  fs.chmodSync(path, 0o600); // plist embeds the proxy secret — keep owner-only
+  console.log("CHANGED");
+}
+' "$PLIST")
+  if echo "$PLIST_REPAIR_OUT" | grep -q "CHANGED"; then
+    log "WARNING: plist env vars repaired — $(echo "$PLIST_REPAIR_OUT" | grep -v '^CHANGED$' | tr '\n' ' ')"
     REPAIRED=1
+  elif echo "$PLIST_REPAIR_OUT" | grep -q "NOSECRET"; then
+    log "WARNING: plist missing ANTHROPIC_API_KEY but no proxy secret is resolvable — skipping that repair (set PROXY_SECRET or create $PROXY_SECRET_FILE)"
   else
-    log "OK: plist env vars present"
+    log "OK: plist env vars present and in sync"
   fi
 fi
 
@@ -131,6 +169,7 @@ if (oauth && oauth.accessToken && data.profiles && data.profiles["anthropic:clau
   data.profiles["anthropic:claude-cli"].refresh = oauth.refreshToken;
   data.profiles["anthropic:claude-cli"].expires = Date.now() + 365 * 24 * 60 * 60 * 1000;
   fs.writeFileSync(path, JSON.stringify(data, null, 2));
+  fs.chmodSync(path, 0o600); // holds OAuth tokens — keep owner-only
   console.log("Synced token from credentials.json into auth-profiles");
 } else {
   console.log("Nothing to sync (missing fields)");
@@ -184,6 +223,7 @@ if (data.usageStats && data.usageStats["anthropic:claude-cli"]) {
   delete data.usageStats["anthropic:claude-cli"].failureCounts;
 }
 fs.writeFileSync(path, JSON.stringify(data, null, 2));
+fs.chmodSync(path, 0o600); // holds OAuth tokens — keep owner-only
 console.log("Patched: auth-profiles.json order, expiry, and cooldown restored");
 ' "$AUTH_PROFILES"
     REPAIRED=1
@@ -296,6 +336,7 @@ if (data.usageStats && data.usageStats["anthropic:claude-cli"]) {
   delete data.usageStats["anthropic:claude-cli"].failureCounts;
 }
 fs.writeFileSync(path, JSON.stringify(data, null, 2));
+fs.chmodSync(path, 0o600); // holds OAuth tokens — keep owner-only
 console.log("Cleared openclaw cooldown after token refresh");
 ' "$AUTH_PROFILES"
         log "Synced token and cleared openclaw auth cooldown"
